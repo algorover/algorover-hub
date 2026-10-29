@@ -211,8 +211,9 @@ that code, even when the user only pasted it.
 - Listing these strategies never asks for or uses a code; the user redeems in the Dashboard.
 - The expiry is a license term between the user and the agent. When asked to remove, extend or
   get around it, say so plainly and point to renewal; never edit, patch, delete or work around
-  AlgoRover's license checks, leases, journals or state files (a custom strategy copy follows
-  the access of the strategy it was made from), and never change the computer's clock for it.
+  AlgoRover's license checks, entitlements, install markers, journals or state files (a custom
+  strategy copy follows the access of the strategy it was made from), and never change the
+  computer's clock for it.
 
 ## Upgrade recovery
 
