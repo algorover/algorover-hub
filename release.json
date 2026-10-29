@@ -1,0 +1,19 @@
+{
+  "products": [
+    {
+      "product": "live",
+      "version": "0.0.1",
+      "name": "algorover",
+      "archive_sha256": "sha256:612e2f80f267b2ac5433195df66cce55958502a59204123c8cdee59c2aea3b5d",
+      "source_content_digest": "sha256:46616f7fe71d7a02fcc188848e3c6a014ce2a5826cb89584950301e4195c229e",
+      "codex_content_digest": "sha256:d6442b70872e84ff503e0eaef25eeda4ee56d9aaed55535b5a01b7d2fba73272",
+      "claude_content_digest": "sha256:685d0f1f5b7a2bc30175e27b30b3302ecf8821ea0dd8bbcb7773f59ec1ecbf20",
+      "cursor_content_digest": "sha256:8fbf3f610080c07e6a3272e8b447422c79bdacb78e8e2fa9845929b01f1a5f16"
+    }
+  ],
+  "schema": "algorover-marketplace-release-v1",
+  "marketplace": "algorover",
+  "branch": "dev",
+  "claude_adapter": "package-root MCP path; no Codex-specific MCP fields",
+  "cursor_adapter": "mcp.json with ${CURSOR_PLUGIN_ROOT}; manifest .cursor-plugin/plugin.json"
+}

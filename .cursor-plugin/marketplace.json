@@ -1,0 +1,16 @@
+{
+  "plugins": [
+    {
+      "name": "algorover",
+      "source": "plugins/cursor/algorover",
+      "description": "Lightweight router for the local AlgoRover Live Runtime Host."
+    }
+  ],
+  "name": "algorover",
+  "owner": {
+    "name": "Rivendell Holdings Investment Limited"
+  },
+  "metadata": {
+    "description": "Official AlgoRover Live and Research plugins."
+  }
+}

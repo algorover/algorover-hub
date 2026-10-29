@@ -1,0 +1,1 @@
+{"mcpServers":{"algorover-live":{"args":["./resolver.mjs","live"],"command":"node","cwd":".","enabled":true,"env":{"ALGOROVER_ENV":"production"},"env_vars":[],"startup_timeout_sec":180,"tool_timeout_sec":1260,"type":"stdio"}}}

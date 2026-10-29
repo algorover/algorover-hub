@@ -1,0 +1,376 @@
+---
+name: algorover
+description: Route strategy discovery, configuration, custom strategies (changing a strategy's parameters, markets, logic or code as the user's own local copy), backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local AlgoRover Runtime Host. Use for AlgoRover Live workflows; never expose credentials or bypass confirmation gates.
+---
+
+# AlgoRover Live router
+
+The Node Ready Bridge always exposes `algorover_runtime_status`,
+`algorover_runtime_start`, `algorover_runtime_update` and `algorover_runtime_repair`, even
+before Runtime exists. The bridge automatically prepares the release-bound Runtime before first business use; never treat an older compatible Runtime as ready. Call status when Host tools are unavailable, then start once. When
+Runtime is ready, use the six Host meta tools:
+
+1. `algorover_connection_list`
+2. `algorover_tool_search`
+3. `algorover_tool_get`
+4. `algorover_tool_execute`
+5. `algorover_result_present`
+6. `algorover_view_present` (in-chat cards, below)
+
+Search for an operation, fetch its exact current descriptor, then execute with the returned
+`schema_revision`. Do not invent dynamic MCP tools or cache operation schemas in the
+plugin. Strategy package and configuration digests returned by the Runtime must remain
+unchanged through backtest or execution requests.
+
+Route one user outcome at a time:
+
+- account availability goes directly to `algorover_connection_list`;
+- unknown capabilities use one concise English `algorover_tool_search` query, with named
+  toolkits as filters and no execution values in the query;
+- retrieve up to eight exact contracts in one `algorover_tool_get` call;
+- batch only independent calls in `algorover_tool_execute`; a value returned by an earlier
+  call starts a later batch;
+- use `presentation: "if_required"` normally and present only an execute-minted
+  `result_ref`.
+
+Route every ordinary chat request for finding or recommending strategies through
+`algorover_strategy_search`, including identity/keyword lookup, explicit hard filters,
+subjective fit, mixed preferences, “recommend a low-risk strategy” and “find something for
+small capital”. Preserve the user's locale and every supported hard constraint; keep
+unsupported wishes in the natural-language query and disclose constraints the owner cannot
+apply. Never call `algorover_strategy_recommend` or discover/execute
+`catalog.strategy.recommend` for an ordinary chat request, and never create a V3
+questionnaire payload. Only an explicit request to open/start the questionnaire or strategy
+onboarding may enter the onboarding flow below. The onboarding App, or its explicitly
+requested textual fallback, submits the complete confirmed V2 questionnaire. Preserve the
+owner order and never merge repeated searches into a new owner ranking. If the user asks for an exact number of recommendations, send that number as
+`limit` (for example, `limit=1`, `limit=2` or `limit=3`); do not let the search tool default
+to ten results for a counted request. Use a larger explicit limit only when the user asks for
+options or multiple candidates. For “open”, “start” or “launch AlgoRover”, ensure Runtime is ready, then
+call `algorover_dashboard_open`; present its URL as a link (Dashboard links below) and never
+spawn a legacy Dashboard directly.
+
+## In-chat cards
+
+`algorover_view_present` shows one AlgoRover card in the conversation. The Runtime keeps the
+card's state, so it survives reloads and updates itself; its text result is what you tell the
+user, briefly, without repeating every number the card shows. Show a card when it helps the
+user follow or decide, not for every call:
+
+- `backtest` with `{job_ref}` right after `backtest.run.start` (it follows the job to the
+  result), or `{run_ref}` when the user asks about a saved run.
+- `configuration` with `{strategy_slug, strategy_version}` (and `configuration` when not
+  `default`) when the user wants to review or change panel settings; the user can edit and
+  start a backtest there. Order fraction and max total exposure are locked to the strategy
+  version.
+- `monitor` with `{venue, mode, instance_id}` after a start resolves, or when the user asks how
+  a running strategy is doing. The user can stop it in the card; the stop is the same attended
+  confirmation, so never also call `trading.instance.stop` for that request.
+- `incident` with `{reference}` (a `job_`, `req_`, `diag_` reference, a run ID or an
+  instance) for a failure, or `{}` to list recent ones. It is read-only like the diagnosis
+  below.
+- `task` with `{}` when the user asks where things stand; it shows this conversation's stages
+  from needs to a running strategy and the references to continue with.
+- `leaderboard` with `{sort, query?, locale}` for "top strategies by return / Sharpe /
+  drawdown" (sort `return`, `drawdown`, `sharpe` or `published`); add `access: "redeem_code"`
+  when the user asks which strategies need a redeem code (and `access: "open"` for the ones that
+  do not; see Agent redeem codes below); `installed` with `{locale}` for "what do I have";
+  `glossary` with `{metrics, locale}` when the user asks what a metric means. metrics uses
+  exactly these names (`max_drawdown_pct`, not `max_drawdown`): `return_pct`, `annualized_return_pct`, `max_drawdown_pct`, `sharpe`, `sortino`, `profit_factor`, `win_rate`, `realized_pnl`, `trades_per_30d`, `median_holding_minutes`, `max_consecutive_losses`, `worst_trade_pct`, `capacity_usd`, `match_score`, `order_fraction`, `max_total_exposure_fraction`, `max_equivalent_leverage`, `leverage`, `starting_balance`, `fee_bps`. locale is `en`, `zh-CN`,
+  `zh-TW` or `ko`.
+- When a card call answers an error naming a field and its valid values, correct that field and
+  call once more instead of answering without the card.
+
+A card's own actions (save, start a backtest, stop, page) are the user's; when the card later
+tells you what happened (it arrives with the user's next message), continue from that and do
+not repeat the action.
+
+## Dashboard links
+
+Show a Dashboard URL as one Markdown link with a short label in the user's language, never as
+the raw address: for example `[打开 AlgoRover 控制台](<url>)`, or, when a strategy target was
+opened, `[在 AlgoRover 中查看 <strategy name> <version>](<url>)`.
+
+- A message "Dashboard 已准备好，请点击打开：<url>" is posted by the AlgoRover card's view
+  button and already carries a fresh link to that strategy: reply only with that exact URL as
+  the link. Do not call `algorover_dashboard_open` for it; a new link without the card's target
+  would open the Dashboard without the strategy.
+- A link signs the browser in once within 10 minutes. When the user asks to open it again
+  later, call `algorover_dashboard_open` again with the same `target` as before.
+
+## Custom strategies
+
+A custom strategy is the user's own copy of an installed strategy, saved as revisions r1, r2…
+It stays on this computer. Its revisions are installed packages with slug `custom-<id>-r<N>`
+and version `0.0.<N>`; backtest and deploy them like any other installed strategy.
+
+Where a change goes:
+
+- Panel settings (target exchange, starting balance, fees, leverage, max equivalent leverage)
+  of any strategy: `workspace.configuration.get`, then `workspace.configuration.save` on that
+  strategy's directory name. No custom strategy, no question. Order fraction and max total
+  exposure are locked to the strategy version: changing them is a custom strategy.
+- Anything else on an original Marketplace strategy (strategy parameters, even "just backtest
+  it with length 20", instruments, bars, indicators, entries, exits, sizing, code): ask first,
+  in the user's language: "This change goes beyond the panel settings, so it is saved as a
+  custom strategy『<strategy name> · <label>』; the original stays unchanged. Create it?"
+  Suggest the label yourself (2–4 words naming the change, at most 8 CJK characters or 16
+  letters) and say the user can reply with another one. Create only after a yes. On a no,
+  change nothing; mention a panel setting when one achieves something similar.
+- A change to an existing custom strategy: no question; save its next revision.
+- "Make another version" or "keep both": ask for a label, then create a new custom strategy
+  whose source is that custom revision's slug and version.
+- Deleting a custom strategy happens only in the Dashboard; point the user there.
+- Runs never override parameters: `overrides` take only `venue`, `period_days` and `workspace`.
+
+Steps:
+
+1. The source must be installed (`strategy.installed.list`); `custom_strategy.create` refuses
+   others with `custom_source_not_installed`. When it is not, tell the user and, with their
+   consent, install that exact version first (`strategy.install`, wait for the job). A custom
+   strategy is a full copy: uninstalling the original later does not affect it.
+   Then call `custom_strategy.create` with the source `slug` and `version` and the label. When
+   `label_adjusted` is true a number was added to keep it unique; use the returned
+   `display_name`. A refused label (`custom_label_invalid`) breaks a rule: 2–16 display width,
+   letters, digits, spaces and `· - + % . / ( )`, not only words like "custom", not the
+   strategy name itself.
+2. Existing strategy parameters: pass them as `parameters` to the commit. Code, markets or new
+   parameters: `custom_strategy.draft.read` (without `path` lists the files), then
+   `custom_strategy.draft.write` with the whole file and the `sha256` you read as
+   `expected_sha256`. To trade another symbol or timeframe, call `custom_strategy.draft.market`
+   with `symbol` (e.g. `SOL`) and `timeframe` (e.g. `4-HOUR`) first without `apply`: it changes
+   the strategy fields, `backtest.markets` and every venue variant together. Tell the user the
+   plan, especially `remove_venues` (exchanges that do not list the symbol), and call it again
+   with `apply: true`, the plan's `preset_sha256` as `expected_sha256` and `remove_venues` only
+   after they agree. `custom_market_unsupported` means the preset has several markets or an
+   unsupported exchange: then edit the `strategy` instrument and bar fields and
+   `backtest.markets` (and `venue_variants`) of `configs/default.json` together; a bar type is
+   `<instrument_id>-<step>-<aggregation>-<price type>-<source>`, e.g.
+   `BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL`, and every preset trades exactly one venue.
+3. `custom_strategy.revision.commit` with a one-line `change_summary` in the user's language.
+   `committed` gives the new revision: report "已保存为『<display name>』r<N>（<change>）".
+   `unchanged` means nothing differed. `problems` name the file and line, or the preset,
+   venue and parameter: fix them in the draft and commit again; show them to the user only when
+   you cannot fix them.
+4. When the user asks to backtest while `draft.state` is `modified`, commit first and say which
+   revision runs. A deployed instance stays on its revision. One trading account runs one
+   instance, so moving to a new revision means stopping the old instance (the user confirms)
+   and deploying the new one.
+5. After saving a custom strategy's first revision, and whenever the user asks to see it, call
+   `algorover_dashboard_open` with target `{"kind": "custom_strategy", "custom_id": <id>,
+   "revision": <N>}` and show the link labelled with its display name, for example
+   `[在 AlgoRover 中查看『自适应 ADX 策略 · 周期20』r1](<url>)`. Never open a custom revision with a
+   `{"kind": "strategy"}` target: that one is for Marketplace versions.
+
+Name custom strategies『<strategy name> · <label>』r<N>, never by slug or id. When "this
+strategy" or a name could mean several targets (the original, several custom strategies,
+revisions or instances), list numbered candidates with display name, revision and running
+state (add "based on <source version>" when originals share a name) and ask. When the user
+does not choose and goes on:
+
+- reading, comparing, explaining: answer for every candidate;
+- changing: never change an existing custom strategy. Create a new one from the original the
+  user last named explicitly, without a label (it is named "自定义 N" / "Custom N"), and say
+  so: "因为没有确认目标，已另建『… · 自定义 2』，原有的自定义策略没有变动". When even the
+  original is unclear, keep asking;
+- backtesting: keep asking;
+- deploying, stopping, flattening: never guess; require an explicit target.
+
+## Agent redeem codes
+
+Some strategies are sold through agents: the user needs a one-time redeem code before the
+strategy can be downloaded and run. Access from a code lasts a limited time: the code states
+its days, counted from redeeming, and a code redeemed while access is still valid adds its days
+to the current expiry date. When a message contains an AlgoRover redeem code
+(`EP-XXXX-XXXX-XXXX-XXXX`, any letter case, spaces allowed), for example
+"请使用 AlgoRover 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略", call `algorover_redeem_code_open` with
+that code, even when the user only pasted it.
+
+- The tool only previews the code and returns a Dashboard link; redeeming (or renewing) happens
+  in the Dashboard after the user confirms there. Never redeem a code from chat, never retry it,
+  and never call `strategy.install` for a strategy the tool reports as needing a code.
+- Relay the tool's result in the user's language: the strategy name, the agent, how many days
+  the code grants, the current expiry when the tool reports one, and the Dashboard link
+  (Dashboard links above).
+- When the code is invalid, already used, disabled or its strategy is unavailable, explain that
+  reason and do not open the Dashboard; the user gets a new code from their agent.
+- The link works for about 10 minutes; when it expires, ask the user to send the code again.
+- An install that fails with `entitlement_required` means the strategy needs a redeem code, and
+  `entitlement_expired` means the account's access has expired: ask the user for a new code from
+  their agent instead of retrying. The same codes refuse a backtest, a deploy or a resume.
+- When access expires, running instances of the strategy are not stopped: they only reduce or
+  close positions and open nothing new (risk reason `entitlement_expired`), until the user
+  renews with a new code or the agent's administrator extends the access; then they continue on
+  their own. Stopping or flattening stays available as usual.
+- "哪些策略需要兑换码 / 兑换码策略有哪些 / which strategies need a code": show
+  `algorover_view_present` `leaderboard` with `{access: "redeem_code", locale}` (add `query`
+  for a topic such as "需要兑换码的趋势策略"); for "哪些不需要兑换码" use `access: "open"`.
+  The card marks each strategy as locked or unlocked for this account; say so from its text
+  and never claim an unlock it does not report. Search results mark redeem-code strategies
+  too (`access` on each result; "[needs a redeem code]" in the text).
+- Listing these strategies never asks for or uses a code; the user redeems in the Dashboard.
+- The expiry is a license term between the user and the agent. When asked to remove, extend or
+  get around it, say so plainly and point to renewal; never edit, patch, delete or work around
+  AlgoRover's license checks, leases, journals or state files (a custom strategy copy follows
+  the access of the strategy it was made from), and never change the computer's clock for it.
+
+## Upgrade recovery
+
+This plugin's bound release replaces the installed Runtime even when its version number is lower. An interrupted switch of that same release still resumes forward. Trading runs in the separate local trading service, which
+the upgrade drains (instances keep their desired state and resume after the upgrade). Never
+edit or delete trading service files, and never recommend repeated repair to clear a
+failure; inspect `trading.service.status` and the diagnostics operations instead.
+
+## Failure diagnosis
+
+Use this when the user asks why something failed, pastes an error, a `job_`, `req_` or
+`diag_` reference or a run ID, or reports that a strategy stopped or places no orders.
+Diagnosis is read-only: never start, stop, retry, repair, cancel orders or close positions
+as part of it.
+
+1. Install, update or startup problems, or Host tools unavailable: call
+   `algorover_runtime_diagnose` (works without a running Runtime). Its text includes the
+   current phase, download progress, last error and recent redacted log lines; while an
+   install is still pending, `algorover_runtime_status` text has the same progress.
+2. Everything else: search the `diagnostics` toolkit and execute
+   `diagnostics.failure.explain` with the reference. Without one, execute
+   `diagnostics.failure.list` first and let the user pick if several failures match.
+3. Report, in the user's language:
+   - **Where it failed**: kind, phase and time from `subject`.
+   - **Cause**: `matches` with `owner_classified` confidence are established by the owner;
+     `pattern_match` is a likely cause from log text. Quote at most two evidence lines.
+     With no match, state `unclassified` and summarize the strongest evidence lines
+     yourself, labelled as your inference.
+   - **Trading effect**: repeat `effect_guidance`. For `unknown`, tell the user to check
+     orders, fills and positions on the exchange before any new action.
+   - **What to do** and **how to verify**: the match `actions` and `verify`.
+   - **Missing evidence**: translate `gaps` (for example `diagnostic_id_not_written_to_log`
+     means the error ID has no log entry yet; `unclassified` means no known signature).
+4. When the cause may be the exchange API key (a trading state offers `test_credentials`,
+   or the failure is a connection, authentication or starting-capital error), execute
+   `credentials.test` with that account's `venue` and `mode`. It only reads the account and
+   logs in to the private stream; report its `result`, the failed step's `venue_code` and
+   what to change. Never ask the user to paste keys to test them.
+5. Never present a guess as the cause, never ask for API keys or tokens, and never tell the
+   user to edit or delete AlgoRover state files. If the user wants support, give them the
+   reference IDs and the evidence lines, which are already redacted.
+
+## First-use onboarding
+
+Run this flow when the user's entire message is only an AlgoRover Live plugin mention
+(apart from whitespace), when the `algorover-setup` skill runs (plugin setup after
+installation), when the user selects an interactive-onboarding starter prompt, or when the user explicitly asks to open/start the questionnaire or onboarding. Treat a
+mention-only message as a request to launch the Dashboard and interactive onboarding;
+do not reply with a generic menu or ask what the user wants to do. A plain request to find
+or recommend a strategy is not onboarding. Reply in the user's current language (`en`,
+`ko`, `zh-CN` or `zh-TW`); if the mention-only message gives no language signal, use the
+conversation's language, then the host locale, and otherwise English.
+Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
+must go directly to that outcome and must not force the questionnaire.
+
+1. Call `algorover_runtime_status`, then `algorover_runtime_start` when the bound target
+   needs starting, installation or recovery. Let the script decide whether to reuse,
+   start, prepare or resume; do not infer process liveness from stored job states or
+   historical lifecycle phases and do not assemble alternative shell recovery commands.
+   Wait for the original call's final result; yielded/running is not completed. If the
+   script reports `runtime_operation_pending`, wait on that call or query status with
+   bounded backoff, without parallel open calls or duplicate installations. Status text
+   includes the current state, required action, phase, download progress, last error and recent log lines.
+   When `state=update_required`, call `algorover_runtime_start`; that start upgrades to the
+   plugin-bound release. `previous_lifecycle`, including an earlier `host_start_timeout`, belongs
+   to the previous release. Do not diagnose or restart that old Host before this start.
+   When `state=awaiting_confirmation`, show `switch.jobs` and ask once: “暂不切换”
+   (`defer`) or “暂停并继续升级” (`stop_and_continue`), translated into the user's
+   language. A `kind: "trading"` entry means running strategies pause during the switch
+   (positions and orders stay as they are) and resume automatically once the new version
+   is ready. Other entries are trading tasks of the previous version; they are stopped
+   keeping their positions, which does not cancel orders or close positions, and the new
+   version lists what it finds on the exchange for the user to take over or close.
+   Submit the chosen action to the same lifecycle tool with the returned `operation_id`
+   and `snapshot_digest`; never invent or reuse a changed snapshot. This choice
+   authorizes only the listed pause or stop, not an orders/positions review. A refreshed
+   snapshot requires a fresh choice. On `deferred`, end this target
+   startup request and leave the old environment alone; do not open old onboarding as
+   target success. Report other failures and their script-provided recovery action.
+   For `stale_session`, reload the plugin session. A lower version number is not stale: `algorover_runtime_start` installs this plugin's bound release.
+   For `host_start_timeout`, tell the user that reloading or restarting Cursor does not
+   restart the Host. The Host is a separate sign-in task. Do not invent a shell command
+   to end it, and do not ask the user to end it in Task Scheduler. Call
+   `algorover_runtime_start` again: that start ends a Host task that is still occupying
+   the slot, then starts the current Runtime. If the same timeout returns, report it.
+2. For this Dashboard-and-onboarding request, all successful paths (already running,
+   stopped target started, first installation, upgrade or repair) continue identically.
+   Only after `state=ready` and `connection_ready=true`, call
+   `algorover_dashboard_open` once and present its URL as a link (Dashboard links). Then call
+   `algorover_onboarding_open` once with the current locale. On success, hand control to
+   that interactive card and end the turn. A brief instruction to continue in the card is
+   enough; do not repeat questionnaire choices in chat or call another question/selection
+   tool. Keep all seven choices, review and recommendation inside that one App.
+   AlgoRover keeps the questionnaire and its recommendation, and the card passes you their
+   state. When the user later refers to a recommendation by position or role ("the first
+   one", "the safer one"), use exactly the strategy versions that card context names, in the
+   left-to-right order it gives; do not search again or substitute a newer version.
+   The tool does not report rendering visibility. Missing model-visible HTML, missing
+   acknowledgement or delayed rendering is unknown, not evidence of failure. Never claim
+   the card did not appear based on that absence and never automatically start text onboarding
+   alongside a successful App request. Do not restart installation to recover presentation.
+3. Switch to text onboarding only when the host explicitly reports App rendering unsupported
+   or failed, or the user reports the card unusable or explicitly requests text onboarding.
+   A Runtime/tool execution error follows step 1 recovery, not the questionnaire fallback.
+   Apply the **one-question turn boundary**
+   as the formal fallback. The internal field order is `profit_style`,
+   `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`,
+   `universe`. Ask only the first unanswered field, with only that field's choices, and end
+   the assistant turn immediately. Never display the complete questionnaire, a numbered
+   checklist, future questions, future choices or a request for multiple answers. Do not
+   even preview what comes next.
+4. On the user's next message, retain every valid supplied answer and ask only the next
+   unanswered field, then end the turn immediately again. If the current answer is invalid
+   or ambiguous, clarify only the same field and end the turn; do not advance or expose any
+   later field. A message that already contains valid answers may fill them silently, but
+   the response still asks at most one unanswered field.
+5. After the last answer, use a separate assistant turn to summarize the selected values
+   and ask only for explicit confirmation. Do not combine that confirmation request with
+   another question and do not call recommendation before confirmation.
+6. Only in this explicitly requested textual onboarding fallback, call the hidden fallback
+   handler `algorover_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
+   confirmed values and the matching locale. Present exactly the three owner-ranked choices:
+   best fit, relatively steadier and more aggressive, preserving versions, evidence,
+   trade-offs and warnings.
+
+Onboarding never installs a recommended strategy without selection and never starts
+demo or live execution. Authentication remains Dashboard-only and every existing live
+confirmation gate remains unchanged.
+
+For strategy work, prefer the Runtime workflow hints. The normal dependency order is
+catalog search/recommend, exact inspect, install, configuration resolve, backtest start,
+durable job status and result get. Keep the selected slug/version and all returned digests
+unchanged. Login is Dashboard-only: ask the user to open the Live Dashboard. Never start
+Device Authorization or put credentials, access tokens or refresh tokens in chat.
+
+Trading runs as strategy instances in the local trading service. Demo and live are separate
+trading accounts selected by `mode` and `venue`; demo can place orders in an exchange test
+account and never implies live.
+
+Deploying is always two-stage. `trading.instance.prepare` validates and freezes the strategy,
+configuration and venue for ten minutes. `trading.instance.start` requires the attended
+confirmation bound to that exact `prepared_ref`. Never turn a generic “yes” into
+authorization and never place credentials in model arguments or prose.
+
+Trading commands (`start`, `stop`, `resume`, `halt`, `exposure.flatten`, `exposure.adopt`)
+return when the trading service recorded them; what happened at the exchange is read from
+`trading.state.get` (engine, instances, exposure ownership, risk) or `trading.events.list`.
+Every state object lists its `actions`; offer only those. Stopping keeps the position by
+default (`stop_policy: keep`); flattening closes it and needs the user's explicit choice.
+When the outcome of a command is unknown, read the state or repeat with the same
+idempotency key; never repeat it with a new key. Orders or positions the platform cannot
+attribute block the instance until the user adopts or flattens them from the actions.
+
+After an attended result is presented, stop and wait for the App. App submit invokes the
+stored exact Owner call once; do not replay the original Execute as confirmation. Continue
+only from a later status/result read.
+
+The local MCP route and bearer are created in an owner-private staged copy by the Runtime
+Host. If the connection is unavailable, report that the Runtime/Host must be started
+or repaired; do not search for Python, install packages, scan ports or call Marketplace MCP
+as an internal substitute.
