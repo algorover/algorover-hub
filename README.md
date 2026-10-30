@@ -9,6 +9,7 @@ This branch is `dev`. Marketplace ID: `algorover`.
 ```bash
 codex plugin marketplace add algorover/algorover-hub --ref dev
 codex plugin add algorover@algorover
+codex plugin add algorover-research@algorover
 ```
 
 ## Claude Code
@@ -16,6 +17,7 @@ codex plugin add algorover@algorover
 ```bash
 claude plugin marketplace add algorover/algorover-hub@dev
 claude plugin install algorover@algorover
+claude plugin install algorover-research@algorover
 ```
 
 ## Cursor
@@ -23,6 +25,7 @@ claude plugin install algorover@algorover
 Cursor reads `.cursor-plugin/marketplace.json`. Install only these copies:
 
 - `plugins/cursor/algorover`
+- `plugins/cursor/algorover-research`
 
 Copy each directory into Cursor's local plugin directory, then reload the window. macOS and Linux: `~/.cursor/plugins/local/<plugin name>`. Windows: `%USERPROFILE%\.cursor\plugins\local\<plugin name>`. Do not install `plugins/codex` or `plugins/claude` into Cursor; their MCP files use another host root. On Teams or Enterprise, import this repository from Dashboard, then Plugins and MCPs. That import reads `.cursor-plugin/marketplace.json`.
 

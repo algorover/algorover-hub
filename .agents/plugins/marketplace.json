@@ -11,6 +11,18 @@
         "authentication": "ON_INSTALL"
       },
       "category": "Productivity"
+    },
+    {
+      "name": "algorover-research",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex/algorover-research"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Data & Analytics"
     }
   ],
   "name": "algorover",

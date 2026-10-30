@@ -9,6 +9,16 @@
       "codex_content_digest": "sha256:dec497a52c13ee904f5bc1b429a6e83abc87de9b6e2a14ddbc4d3d9be0e04c75",
       "claude_content_digest": "sha256:476a699a058cb4a2429ff1397bf8eea30011e0cfc2e420957229dc907eee09b0",
       "cursor_content_digest": "sha256:9d7157072f8566cf171af2eb673c5c202ce14d3f76ba5fb64c6f155855a029cc"
+    },
+    {
+      "product": "research",
+      "version": "0.0.3",
+      "name": "algorover-research",
+      "archive_sha256": "sha256:cb23b0a18adb372c0749e20c268ba6a2932434a1202ba996cb5c3ea89c9651bc",
+      "source_content_digest": "sha256:c5c89830c9b2a0264ea586e7cdb38e85b5575370b8a30e0fb93dfdfc2b5638da",
+      "codex_content_digest": "sha256:ec6d0b38f37399215e4c5cd52df5692ab2c2253da750b142312f7218118f2716",
+      "claude_content_digest": "sha256:b0cd0e2344d96109544ff028f71e8dbb44b05f39b0283fdccc3811062b61ca8a",
+      "cursor_content_digest": "sha256:fccfb93bb33ece421760772fea47dde91400bbfc20bb42b05529b42057548454"
     }
   ],
   "schema": "algorover-marketplace-release-v1",

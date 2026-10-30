@@ -4,6 +4,11 @@
       "name": "algorover",
       "source": "plugins/cursor/algorover",
       "description": "Lightweight router for the local AlgoRover Live Runtime Host."
+    },
+    {
+      "name": "algorover-research",
+      "source": "plugins/cursor/algorover-research",
+      "description": "Lightweight router for the local AlgoRover Research Runtime Host."
     }
   ],
   "name": "algorover",
