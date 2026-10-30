@@ -635,7 +635,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.2";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.3";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -1488,7 +1488,18 @@ function removeGeneratedFilesystemMetadata(root, errorCode) {
   }
 }
 
-export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximumReleases = 1, maximumBytes = 5 * 1024 ** 3 }) {
+function cleanupManifest(entry) {
+  let manifest;
+  try {
+    manifest = validateManifest(JSON.parse(readFileSync(join(entry.path, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
+  } catch (error) {
+    if (error instanceof BootstrapError && error.code === "runtime_identity_invalid") return null;
+    throw error;
+  }
+  return releaseDirectoryHolds(entry.name, manifest.runtime_id) ? manifest : null;
+}
+
+export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximumReleases = 1, maximumBytes = 5 * 1024 ** 3, force = false }) {
   if (!Number.isSafeInteger(maximumReleases) || maximumReleases < 1 || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1) fail("gc_policy_invalid", "Runtime GC policy is invalid");
   return withInstallLock(stateRoot, async () => {
     const releases = join(stateRoot, "releases");
@@ -1516,24 +1527,30 @@ export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximu
       ? runtimeDirectory(pointer.current_runtime_id) : pointer.current_runtime_id.slice("sha256:".length);
     for (const entry of entries) entry.current = entry.name === currentName;
     // Every release other than the current one proves which Runtime it holds before it is kept or removed.
+    const unidentified = [];
     for (const entry of entries) {
       if (entry.current) { entry.runtimeId = pointer.current_runtime_id; continue; }
-      const manifest = validateManifest(JSON.parse(readFileSync(join(entry.path, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
-      if (!releaseDirectoryHolds(entry.name, manifest.runtime_id)) fail("runtime_identity_invalid", "Cleanup Runtime identity differs");
+      const manifest = cleanupManifest(entry);
+      if (manifest === null) { unidentified.push(entry); continue; }
       entry.runtimeId = manifest.runtime_id;
       entry.executable = safeDestination(entry.path, manifest.payload.python.executable);
     }
-    const others = entries.filter((entry) => !entry.current);
+    if (unidentified.length > 0 && !force) {
+      throw new BootstrapError("runtime_identity_invalid", "Cleanup Runtime identity differs", { paths: unidentified.map((entry) => entry.path).sort() });
+    }
+    for (const entry of unidentified) rmSync(entry.path, { recursive: true, force: true });
+    const manageable = entries.filter((entry) => !unidentified.includes(entry));
+    const others = manageable.filter((entry) => !entry.current);
     const inUse = others.length ? runtimeExecutablesInUse(others.map((entry) => entry.executable)) : new Set();
     // A release whose interpreter still runs (a task finishing on the old Runtime, D44) is kept.
-    const keep = new Set(entries.filter((entry) => entry.current || inUse.has(entry.executable)));
+    const keep = new Set(manageable.filter((entry) => entry.current || inUse.has(entry.executable)));
     // Any other legacy release is never a rollback candidate: it stays only while its interpreter runs.
-    for (const entry of entries) if (!entry.legacy && keep.size < maximumReleases) keep.add(entry);
+    for (const entry of manageable) if (!entry.legacy && keep.size < maximumReleases) keep.add(entry);
     let retainedBytes = [...keep].reduce((sum, entry) => sum + entry.bytes, 0);
     const removed = new Set();
-    for (const entry of [...entries].reverse()) {
+    for (const entry of [...manageable].reverse()) {
       if (keep.has(entry)) continue;
-      if (!entry.legacy && entries.length - removed.size <= maximumReleases && retainedBytes <= maximumBytes) continue;
+      if (!entry.legacy && manageable.length - removed.size <= maximumReleases && retainedBytes <= maximumBytes) continue;
       rmSync(entry.path, { recursive: true, force: true });
       removed.add(entry);
     }
@@ -1547,7 +1564,7 @@ export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximu
       }
     }
     const pluginStagesRemoved = pluginStateRoot === null ? [] : garbageCollectPluginStages(pluginStateRoot);
-    return { removed: [...removed].map((entry) => entry.runtimeId).sort(), retained: entries.filter((entry) => !removed.has(entry)).map((entry) => entry.runtimeId).sort(), bytes: retainedBytes, plugin_stages_removed: pluginStagesRemoved };
+    return { removed: [...removed].map((entry) => entry.runtimeId).sort(), retained: manageable.filter((entry) => !removed.has(entry)).map((entry) => entry.runtimeId).sort(), bytes: retainedBytes, plugin_stages_removed: pluginStagesRemoved, forced: unidentified.map((entry) => entry.path).sort() };
   });
 }
 
@@ -1779,7 +1796,7 @@ async function completeSwitch({ transaction, runtime, home, stateRoot, pluginSta
     host: started, trading, lifecycle: transaction.value };
 }
 
-function previousRuntime(stateRoot, transaction, previousId, product) {
+export function previousRuntime(stateRoot, transaction, previousId, product) {
   if (!previousId) return null;
   // ``root`` is where the old Host ran from, also when a switch already retired the directory.
   const installed = releaseRoot(stateRoot, previousId), legacy = legacyReleaseRoot(stateRoot, previousId);
@@ -1787,9 +1804,17 @@ function previousRuntime(stateRoot, transaction, previousId, product) {
   const root = !existsSync(join(installed, "RUNTIME.json")) && (existsSync(join(legacy, "RUNTIME.json")) || legacyRetired) ? legacy : installed;
   const manifestPath = existsSync(join(root, "RUNTIME.json")) ? join(root, "RUNTIME.json")
     : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : null;
-  if (!manifestPath) fail("runtime_identity_invalid", "Previous Runtime manifest is missing");
-  const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
-  if (manifest.runtime_id !== previousId || manifestProduct(manifest) !== product) fail("runtime_identity_invalid", "Previous Runtime identity differs");
+  // This install is being replaced. A missing or rewritten manifest cannot name leftover
+  // processes, and the new Runtime still has to pass its own identity check.
+  if (!manifestPath) return null;
+  let manifest;
+  try {
+    manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
+  } catch (error) {
+    if (error instanceof BootstrapError && error.code === "runtime_identity_invalid") return null;
+    throw error;
+  }
+  if (manifest.runtime_id !== previousId || manifestProduct(manifest) !== product) return null;
   return { root, manifest, python: safeDestination(root, manifest.payload.python.executable) };
 }
 
@@ -2852,7 +2877,11 @@ async function cliUnlocked(arguments_) {
     if (output !== null) atomicJson(absoluteOption(options, "output"), value);
     return { ...value, diagnostic_output: output === null ? null : absoluteOption(options, "output") };
   }
-  if (command === "gc") return { schema: "algorover-bootstrap-result-v1", gc: await garbageCollect({ stateRoot, pluginStateRoot, maximumReleases: Number(option(options, "maximum-releases", "1")), maximumBytes: Number(option(options, "maximum-bytes", String(5 * 1024 ** 3))) }) };
+  if (command === "gc") {
+    const force = option(options, "force", "no");
+    if (!["yes", "no"].includes(force)) fail("usage", "--force takes yes or no");
+    return { schema: "algorover-bootstrap-result-v1", gc: await garbageCollect({ stateRoot, pluginStateRoot, maximumReleases: Number(option(options, "maximum-releases", "1")), maximumBytes: Number(option(options, "maximum-bytes", String(5 * 1024 ** 3))), force: force === "yes" }) };
+  }
   if (command === "uninstall") {
     return uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName });
   }
@@ -2934,6 +2963,10 @@ export function formatBootstrapError(error) {
   const lines = [`AlgoRover bootstrap: ${code}`];
   if (code === "windows_long_paths_denied") {
     lines.push("AlgoRover bootstrap: approve the administrator prompt to set LongPathsEnabled=1");
+  }
+  if (code === "runtime_identity_invalid" && error instanceof BootstrapError && Array.isArray(error.details?.paths)) {
+    for (const path of error.details.paths) lines.push(`AlgoRover bootstrap path: ${path}`);
+    lines.push("AlgoRover bootstrap: rerun gc with --force yes to delete these releases");
   }
   if (code === "runtime_path_too_long" && error instanceof BootstrapError && error.details !== null) {
     const { length, limit, required_reduction, runtime_id, directory, path } = error.details;
