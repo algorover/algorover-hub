@@ -87,14 +87,19 @@ not repeat the action.
 
 ## Dashboard links
 
-Show a Dashboard URL as one Markdown link with a short label in the user's language, never as
-the raw address: for example `[打开 AlgoRover 控制台](<url>)`, or, when a strategy target was
-opened, `[在 AlgoRover 中查看 <strategy name> <version>](<url>)`.
+Show a Dashboard URL as one Markdown link with a short label written in the language of the
+user's own messages, never as the raw address: for example `[Open the AlgoRover Dashboard](<url>)`
+or `[打开 AlgoRover 控制台](<url>)`, or, when a strategy target was opened,
+`[View <strategy name> <version> in AlgoRover](<url>)` or `[在 AlgoRover 中查看 <strategy name> <version>](<url>)`.
 
-- A message "Dashboard 已准备好，请点击打开：<url>" is posted by the AlgoRover card's view
-  button and already carries a fresh link to that strategy: reply only with that exact URL as
-  the link. Do not call `algorover_dashboard_open` for it; a new link without the card's target
-  would open the Dashboard without the strategy.
+- A card's Dashboard button posts a one-line message holding one Dashboard link, in one of
+  these forms: "Dashboard is ready. Click to open: <url>", "Dashboard 已准备好，请点击打开：<url>",
+  "Dashboard 已準備好，請點擊開啟：<url>" or "Dashboard가 준비되었습니다. 클릭하여 여세요: <url>".
+  It already carries a fresh link to the card's strategy, page or task: reply only with that
+  exact URL as the link. Do not call `algorover_dashboard_open` for it; a new link without the
+  card's target would open the Dashboard without it.
+- That message comes from the card, not from the user: it is no signal of the user's language.
+  Keep replying in the language of the user's own messages.
 - A link signs the browser in once within 10 minutes. When the user asks to open it again
   later, call `algorover_dashboard_open` again with the same `target` as before.
 
@@ -294,6 +299,7 @@ must go directly to that outcome and must not force the questionnaire.
    startup request and leave the old environment alone; do not open old onboarding as
    target success. Report other failures and their script-provided recovery action.
    For `stale_session`, reload the plugin session. A lower version number is not stale: `algorover_runtime_start` installs this plugin's bound release.
+   If its message is `runtime_platform_unsupported`, this plugin release has no Runtime for the user's operating system and CPU yet: say so, do not retry, repair or reload, and suggest updating the plugin after a release for that platform.
    For `host_start_timeout`, tell the user that reloading or restarting Cursor does not
    restart the Host. The Host is a separate sign-in task. Do not invent a shell command
    to end it, and do not ask the user to end it in Task Scheduler. Call

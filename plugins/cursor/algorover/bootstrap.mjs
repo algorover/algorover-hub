@@ -635,7 +635,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.3";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.4";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -645,8 +645,8 @@ const LOCAL_MARKETPLACE_ORIGIN = "http://127.0.0.1:18080";
 // build fail; unknown entries remain fail-closed below.
 const GENERATED_FILESYSTEM_METADATA = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 const ENVIRONMENT_PORTS = Object.freeze({
-  local: Object.freeze({ live: 18787, research: 18686 }),
-  production: Object.freeze({ live: 8787, research: 8686 }),
+  local: Object.freeze({ live: 19797, research: 19696 }),
+  production: Object.freeze({ live: 9797, research: 9696 }),
 });
 
 export class BootstrapError extends Error {
@@ -2520,8 +2520,8 @@ export async function startHost({ home = null, stateRoot, pluginStateRoot, liveS
   const { manifest } = runtime;
   const product = manifestProduct(manifest);
   const runtimeHome = home ?? dirname(stateRoot);
-  const liveDashboardPort = Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 8787);
-  const researchDashboardPort = Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 8686);
+  const liveDashboardPort = Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 9797);
+  const researchDashboardPort = Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 9696);
   validateEnvironmentIsolation({
     product,
     environmentName,
@@ -2772,8 +2772,8 @@ async function serviceCommand({ action, kind, force, home, stateRoot, pluginStat
   }
   if (action !== "stop") {
     const runtime = await activeRuntime(stateRoot, null);
-    const liveDashboardPort = Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 8787);
-    const researchDashboardPort = Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 8686);
+    const liveDashboardPort = Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 9797);
+    const researchDashboardPort = Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 9696);
     const hostArgs = hostArguments({ root: runtime.root, manifest: runtime.manifest, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot,
       trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort: DEFAULT_HOST_PORT, liveDashboardPort, researchDashboardPort });
     refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode: readServicesRecord(home)?.mode ?? null });
@@ -2845,7 +2845,7 @@ export async function cli(arguments_) {
   if (!["live", "research"].includes(product)) fail("usage", "bootstrap requires --product live|research");
   const home = absoluteOption(options, "runtime-home", join(homedir(), `.algorover-runtime-${product}-production`));
   const environmentName = option(options, "environment", "production");
-  validateEnvironmentIsolation({ product, environmentName, marketplaceOrigin: option(options, "marketplace-origin", product === "live" ? (environmentName === "local" ? LOCAL_MARKETPLACE_ORIGIN : PRODUCTION_MARKETPLACE_ORIGIN) : null), runtimeHome: home, liveStateRoot: absoluteOption(options, "live-state-root", join(homedir(), ".algorover")), researchStateRoot: absoluteOption(options, "research-state-root", join(homedir(), ".algorover-research")), liveDashboardPort: Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 8787), researchDashboardPort: Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 8686) });
+  validateEnvironmentIsolation({ product, environmentName, marketplaceOrigin: option(options, "marketplace-origin", product === "live" ? (environmentName === "local" ? LOCAL_MARKETPLACE_ORIGIN : PRODUCTION_MARKETPLACE_ORIGIN) : null), runtimeHome: home, liveStateRoot: absoluteOption(options, "live-state-root", join(homedir(), ".algorover")), researchStateRoot: absoluteOption(options, "research-state-root", join(homedir(), ".algorover-research")), liveDashboardPort: Number(process.env.ALGOROVER_LIVE_DASHBOARD_PORT ?? 9797), researchDashboardPort: Number(process.env.ALGOROVER_RESEARCH_DASHBOARD_PORT ?? 9696) });
   if (["status", "doctor"].includes(command) || (command === "service" && arguments_[1] === "status")) return cliUnlocked(arguments_);
   return withLifecycleLock(join(home, "runtime"), () => cliUnlocked(arguments_));
 }

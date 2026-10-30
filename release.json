@@ -2,13 +2,13 @@
   "products": [
     {
       "product": "live",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "name": "algorover",
-      "archive_sha256": "sha256:8cfe06903e5514dde98d3bc10a93547d33126e3093289133d0cec2b08c159eb9",
-      "source_content_digest": "sha256:9f3a1f9a3c166c30ec893a8895a2dc85c0a98ec0b35892010ba941b20a786600",
-      "codex_content_digest": "sha256:dec497a52c13ee904f5bc1b429a6e83abc87de9b6e2a14ddbc4d3d9be0e04c75",
-      "claude_content_digest": "sha256:476a699a058cb4a2429ff1397bf8eea30011e0cfc2e420957229dc907eee09b0",
-      "cursor_content_digest": "sha256:9d7157072f8566cf171af2eb673c5c202ce14d3f76ba5fb64c6f155855a029cc"
+      "archive_sha256": "sha256:ed55804aac57d38f257b48aad3444eb4bb5cd8e8f1ce30419b41862970637298",
+      "source_content_digest": "sha256:475616e1a8993821e444db116d7490322dd8a95976762f295135be51fe6d2b64",
+      "codex_content_digest": "sha256:7666ed9af5e84c0fc8dc1158bd450a88fd3d5854e5b38db7a1b9e22ba4701a7f",
+      "claude_content_digest": "sha256:a862053699cf758f68efed85c2844e411bf136f605d69f153e3deda65c65047a",
+      "cursor_content_digest": "sha256:4a29780b2d036ba5534c17d559b1cb68ee0bd77b53153967b6aa94a810641d55"
     },
     {
       "product": "research",
