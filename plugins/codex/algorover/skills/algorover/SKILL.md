@@ -95,7 +95,7 @@ or `[打开 AlgoRover 控制台](<url>)`, or, when a strategy target was opened,
 - A card's Dashboard button posts a one-line message holding one Dashboard link, in one of
   these forms: "Dashboard is ready. Click to open: <url>", "Dashboard 已准备好，请点击打开：<url>",
   "Dashboard 已準備好，請點擊開啟：<url>" or "Dashboard가 준비되었습니다. 클릭하여 여세요: <url>".
-  It already carries a fresh link to the card's strategy, page or task: reply only with that
+  It already carries a fresh link to the card's strategy, trading account, page or task: reply only with that
   exact URL as the link. Do not call `algorover_dashboard_open` for it; a new link without the
   card's target would open the Dashboard without it.
 - That message comes from the card, not from the user: it is no signal of the user's language.
@@ -256,7 +256,10 @@ as part of it.
    or the failure is a connection, authentication or starting-capital error), execute
    `credentials.test` with that account's `venue` and `mode`. It only reads the account and
    logs in to the private stream; report its `result`, the failed step's `venue_code` and
-   what to change. Never ask the user to paste keys to test them.
+   what to change. A `result` of `ok` with `warnings` means the exchange answered but the
+   account cannot start a strategy yet: report the warnings, do not call the credentials
+   fine. On Hyperliquid the address must be the main account, not an agent wallet's. Never
+   ask the user to paste keys to test them.
 5. Never present a guess as the cause, never ask for API keys or tokens, and never tell the
    user to edit or delete AlgoRover state files. If the user wants support, give them the
    reference IDs and the evidence lines, which are already redacted.

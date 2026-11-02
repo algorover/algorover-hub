@@ -412,14 +412,17 @@ function liveDashboardTargetSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"} or {kind: \"task\", view_id} (a conversation's task).",
+    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"}, {kind: \"trading_account\", venue, mode: \"demo\" | \"live\", instance_id (optional)} (the Live page at that account) or {kind: \"task\", view_id} (a conversation's task).",
     properties: {
       ...strategy.properties,
-      kind: { enum: ["strategy", "custom_strategy", "page", "task"] },
+      kind: { enum: ["strategy", "custom_strategy", "page", "task", "trading_account"] },
       custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
       revision: { type: "integer", minimum: 1, maximum: 999999 },
       page: { enum: DASHBOARD_PAGES },
       view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" },
+      venue: { type: "string", pattern: "^[A-Z][A-Z0-9_]{1,31}$" },
+      mode: { enum: ["demo", "live"] },
+      instance_id: { type: "string", pattern: "^si_[0-9a-z]{1,61}$" },
     },
     required: ["kind"],
   };
@@ -449,6 +452,17 @@ function dashboardArguments(value) {
     if (Object.keys(target).sort().join(",") !== "kind,view_id" || typeof target.view_id !== "string"
         || !/^view_[0-9a-f]{32}$/.test(target.view_id)) throw new BridgeError("invalid_tool_call");
     return { target: { kind: "task", view_id: target.view_id } };
+  }
+  // The Live page at one trading account, and one instance when given: what a monitor or incident card opens.
+  if (target.kind === "trading_account" && profile === "live") {
+    const keys = Object.keys(target).sort().join(",");
+    if ((keys !== "kind,mode,venue" && keys !== "instance_id,kind,mode,venue")
+        || typeof target.venue !== "string" || !/^[A-Z][A-Z0-9_]{1,31}$/.test(target.venue)
+        || (target.mode !== "demo" && target.mode !== "live")
+        || (keys.startsWith("instance_id") && (typeof target.instance_id !== "string" || !/^si_[0-9a-z]{1,61}$/.test(target.instance_id)))) {
+      throw new BridgeError("invalid_tool_call");
+    }
+    return { target: { ...target } };
   }
   if (target.kind === "custom_strategy" && profile === "live") {
     const keys = Object.keys(target).sort().join(",");
