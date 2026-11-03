@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./assets/algorover-logo-white.svg">
-  <img src="./assets/algorover-logo.png" alt="AlgoRover logo" width="320">
+  <source media="(prefers-color-scheme: dark)" srcset="./readme-assets/algorover-logo-white.svg">
+  <img src="./readme-assets/algorover-logo.png" alt="AlgoRover logo" width="320">
 </picture>
 
 # AlgoRover
@@ -17,7 +17,7 @@ Use **AlgoRover Research** for strategy discovery and historical backtesting. Us
 
 [X / Twitter](https://x.com/AlgoRoverQuant) · [Discord](https://discord.gg/DvsA8gQ3Y) · [Telegram](https://t.me/+TGpYk0NlbD4zYTVk)
 
-![AlgoRover Dashboard and research results](./assets/product-overview.png)
+![AlgoRover Dashboard and research results](./readme-assets/product-overview.png)
 
 Describe a research question, inspect the strategy evidence, and review results in your local Dashboard.
 
@@ -152,7 +152,7 @@ Follow the setup prompts. Plugin installation and Runtime startup are separate s
 
 ## See the workflow
 
-![AlgoRover research workflow](./assets/research-workflow.gif)
+![AlgoRover research workflow](./readme-assets/research-workflow.gif)
 
 | Step | What you do | What to inspect |
 | :--- | :--- | :--- |
@@ -192,20 +192,20 @@ Account data and execution integrations for 14 exchanges and brokers:
 
 | Exchange / broker | Account reading | Execution integration |
 | :--- | :---: | :---: |
-| <img src="./assets/exchanges/alpaca.svg" width="24" height="24" align="absmiddle" alt=""> Alpaca | ✓ | ✓ |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="./assets/exchanges/architect-ax-white.svg"><img src="./assets/exchanges/architect-ax.svg" width="24" height="24" align="absmiddle" alt=""></picture> Architect AX | ✓ | ✓ |
-| <img src="./assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | ✓ | ✓ |
-| <img src="./assets/exchanges/bitget.svg" width="24" height="24" align="absmiddle" alt=""> Bitget | ✓ | ✓ |
-| <img src="./assets/exchanges/bitmex.png" width="24" height="24" align="absmiddle" alt=""> BitMEX | ✓ | ✓ |
-| <img src="./assets/exchanges/bybit.jpg" width="24" height="24" align="absmiddle" alt=""> Bybit | ✓ | ✓ |
-| <img src="./assets/exchanges/deribit.svg" width="24" height="24" align="absmiddle" alt=""> Deribit | ✓ | ✓ |
-| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | ✓ | ✓ |
-| <img src="./assets/exchanges/dydx.svg" width="24" height="24" align="absmiddle" alt=""> dYdX | ✓ | ✓ |
-| <img src="./assets/exchanges/gateio.svg" width="24" height="24" align="absmiddle" alt=""> Gate.io | ✓ | ✓ |
-| <img src="./assets/exchanges/hyperliquid.png" width="24" height="24" align="absmiddle" alt=""> Hyperliquid | ✓ | ✓ |
-| <img src="./assets/exchanges/kraken.svg" width="24" height="24" align="absmiddle" alt=""> Kraken | ✓ | ✓ |
-| <img src="./assets/exchanges/longbridge.png" width="24" height="24" align="absmiddle" alt=""> Longbridge | ✓ | ✓ |
-| <img src="./assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/alpaca.svg" width="24" height="24" align="absmiddle" alt=""> Alpaca | ✓ | ✓ |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="./readme-assets/exchanges/architect-ax-white.svg"><img src="./readme-assets/exchanges/architect-ax.svg" width="24" height="24" align="absmiddle" alt=""></picture> Architect AX | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/bitget.svg" width="24" height="24" align="absmiddle" alt=""> Bitget | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/bitmex.png" width="24" height="24" align="absmiddle" alt=""> BitMEX | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/bybit.jpg" width="24" height="24" align="absmiddle" alt=""> Bybit | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/deribit.svg" width="24" height="24" align="absmiddle" alt=""> Deribit | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/dydx.svg" width="24" height="24" align="absmiddle" alt=""> dYdX | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/gateio.svg" width="24" height="24" align="absmiddle" alt=""> Gate.io | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/hyperliquid.png" width="24" height="24" align="absmiddle" alt=""> Hyperliquid | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/kraken.svg" width="24" height="24" align="absmiddle" alt=""> Kraken | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/longbridge.png" width="24" height="24" align="absmiddle" alt=""> Longbridge | ✓ | ✓ |
+| <img src="./readme-assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | ✓ | ✓ |
 
 Available trading modes depend on the installed adapters and account environment. Longbridge requires a Runtime with Longbridge support.
 
@@ -215,9 +215,9 @@ Public historical candlesticks for backtesting, without trading credentials:
 
 | Data source | Historical backtest data |
 | :--- | :--- |
-| <img src="./assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | USD-M and COIN-M futures |
-| <img src="./assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | Historical candlesticks |
-| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | Perpetual futures |
+| <img src="./readme-assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | USD-M and COIN-M futures |
+| <img src="./readme-assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | Historical candlesticks |
+| <img src="./readme-assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | Perpetual futures |
 
 ## Security and control
 
@@ -271,5 +271,7 @@ When reporting an issue, include the plugin version, host, operating system, ste
 ## Distribution and release provenance
 
 The marketplace is generated from production plugin ZIPs through the source repository's `./build.sh marketplace-sync` command. Published releases include a `release.json` that records input and generated plugin hashes. Credentials, the Runtime, and user state are not stored in this repository.
+
+README images are kept in `readme-assets/`. Plugin artwork stays in each generated plugin's own `assets/` directory.
 
 New installation marketplace ID: `algorover`.
