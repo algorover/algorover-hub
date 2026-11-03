@@ -192,20 +192,20 @@ Account data and execution integrations for 14 exchanges and brokers:
 
 | Exchange / broker | Account reading | Execution integration |
 | :--- | :---: | :---: |
-| <img src="./assets/exchanges/alpaca.svg" width="24" height="24" alt=""> Alpaca | ✓ | ✓ |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="./assets/exchanges/architect-ax-white.svg"><img src="./assets/exchanges/architect-ax.svg" width="24" height="24" alt=""></picture> Architect AX | ✓ | ✓ |
-| <img src="./assets/exchanges/binance.svg" width="24" height="24" alt=""> Binance | ✓ | ✓ |
-| <img src="./assets/exchanges/bitget.svg" width="24" height="24" alt=""> Bitget | ✓ | ✓ |
-| <img src="./assets/exchanges/bitmex.png" width="24" height="24" alt=""> BitMEX | ✓ | ✓ |
-| <img src="./assets/exchanges/bybit.jpg" width="24" height="24" alt=""> Bybit | ✓ | ✓ |
-| <img src="./assets/exchanges/deribit.svg" width="24" height="24" alt=""> Deribit | ✓ | ✓ |
-| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" alt=""> DigiFinex | ✓ | ✓ |
-| <img src="./assets/exchanges/dydx.svg" width="24" height="24" alt=""> dYdX | ✓ | ✓ |
-| <img src="./assets/exchanges/gateio.svg" width="24" height="24" alt=""> Gate.io | ✓ | ✓ |
-| <img src="./assets/exchanges/hyperliquid.png" width="24" height="24" alt=""> Hyperliquid | ✓ | ✓ |
-| <img src="./assets/exchanges/kraken.svg" width="24" height="24" alt=""> Kraken | ✓ | ✓ |
-| <img src="./assets/exchanges/longbridge.png" width="24" height="24" alt=""> Longbridge | ✓ | ✓ |
-| <img src="./assets/exchanges/okx.jpg" width="24" height="24" alt=""> OKX | ✓ | ✓ |
+| <img src="./assets/exchanges/alpaca.svg" width="24" height="24" align="absmiddle" alt=""> Alpaca | ✓ | ✓ |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="./assets/exchanges/architect-ax-white.svg"><img src="./assets/exchanges/architect-ax.svg" width="24" height="24" align="absmiddle" alt=""></picture> Architect AX | ✓ | ✓ |
+| <img src="./assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | ✓ | ✓ |
+| <img src="./assets/exchanges/bitget.svg" width="24" height="24" align="absmiddle" alt=""> Bitget | ✓ | ✓ |
+| <img src="./assets/exchanges/bitmex.png" width="24" height="24" align="absmiddle" alt=""> BitMEX | ✓ | ✓ |
+| <img src="./assets/exchanges/bybit.jpg" width="24" height="24" align="absmiddle" alt=""> Bybit | ✓ | ✓ |
+| <img src="./assets/exchanges/deribit.svg" width="24" height="24" align="absmiddle" alt=""> Deribit | ✓ | ✓ |
+| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | ✓ | ✓ |
+| <img src="./assets/exchanges/dydx.svg" width="24" height="24" align="absmiddle" alt=""> dYdX | ✓ | ✓ |
+| <img src="./assets/exchanges/gateio.svg" width="24" height="24" align="absmiddle" alt=""> Gate.io | ✓ | ✓ |
+| <img src="./assets/exchanges/hyperliquid.png" width="24" height="24" align="absmiddle" alt=""> Hyperliquid | ✓ | ✓ |
+| <img src="./assets/exchanges/kraken.svg" width="24" height="24" align="absmiddle" alt=""> Kraken | ✓ | ✓ |
+| <img src="./assets/exchanges/longbridge.png" width="24" height="24" align="absmiddle" alt=""> Longbridge | ✓ | ✓ |
+| <img src="./assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | ✓ | ✓ |
 
 Available trading modes depend on the installed adapters and account environment. Longbridge requires a Runtime with Longbridge support.
 
@@ -215,9 +215,9 @@ Public historical candlesticks for backtesting, without trading credentials:
 
 | Data source | Historical backtest data |
 | :--- | :--- |
-| <img src="./assets/exchanges/binance.svg" width="24" height="24" alt=""> Binance | USD-M and COIN-M futures |
-| <img src="./assets/exchanges/okx.jpg" width="24" height="24" alt=""> OKX | Historical candlesticks |
-| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" alt=""> DigiFinex | Perpetual futures |
+| <img src="./assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | USD-M and COIN-M futures |
+| <img src="./assets/exchanges/okx.jpg" width="24" height="24" align="absmiddle" alt=""> OKX | Historical candlesticks |
+| <img src="./assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | Perpetual futures |
 
 ## Security and control
 
