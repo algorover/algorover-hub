@@ -1,0 +1,19 @@
+{
+  "plugins": [
+    {
+      "name": "algorover",
+      "source": "./plugins/claude/algorover"
+    },
+    {
+      "name": "algorover-research",
+      "source": "./plugins/claude/algorover-research"
+    }
+  ],
+  "name": "algorover",
+  "owner": {
+    "name": "Rivendell Holdings Investment Limited"
+  },
+  "metadata": {
+    "description": "Official AlgoRover Live and Research plugins."
+  }
+}

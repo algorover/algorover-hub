@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "algorover-live": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CURSOR_PLUGIN_ROOT}/resolver.mjs",
+        "live"
+      ],
+      "env": {
+        "ALGOROVER_ENV": "production"
+      }
+    }
+  }
+}

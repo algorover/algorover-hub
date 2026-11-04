@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "algorover-research": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/resolver.mjs",
+        "research"
+      ],
+      "env": {
+        "ALGOROVER_ENV": "production"
+      }
+    }
+  }
+}
