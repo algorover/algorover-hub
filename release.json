@@ -2,23 +2,23 @@
   "products": [
     {
       "product": "live",
-      "version": "0.0.8",
+      "version": "0.0.9",
       "name": "algorover",
-      "archive_sha256": "sha256:cd7f850b8e56a8991280c79f2028b1fdbf25edeb851ccb694dd9ccec3ec28ca4",
-      "source_content_digest": "sha256:364d62aa7ac75b57564c6ffde9e84f1e556575b02dbce94b88e37a2876327d2f",
-      "codex_content_digest": "sha256:e8fa00943adbb49516fe550cef3a3e4a0030ccbb32e58e30e674500f3c424995",
-      "claude_content_digest": "sha256:2d2c05d83766f6482f146d207115bd6638432793df017d009c4c0b0a461f11c1",
-      "cursor_content_digest": "sha256:8e4163de3170b7e9f86091400d1309be2ce91cfd86a16bfbaab536db97ff1782"
+      "archive_sha256": "sha256:4ae91ef01ec4badfc779d736dd0ff6461d7ef3660e789071f59393d285317f3f",
+      "source_content_digest": "sha256:c278be290d3a28bc651640d74b1c447a913b83103b061fb51d6ee47b04afac0c",
+      "codex_content_digest": "sha256:7647140f99389cad372f3f4ffa1eeb8a17d5127a721ced60f020ec3bcb5f7c92",
+      "claude_content_digest": "sha256:f13ad68f08f9ef4433635ddb041cee2d8c73c00613a93a18dc4f48091a05a144",
+      "cursor_content_digest": "sha256:4fa224ba635c860b6964c9caf331170e8e766708b18c4c73489e82bf13b888ec"
     },
     {
       "product": "research",
-      "version": "0.0.3",
+      "version": "0.0.9",
       "name": "algorover-research",
-      "archive_sha256": "sha256:cb23b0a18adb372c0749e20c268ba6a2932434a1202ba996cb5c3ea89c9651bc",
-      "source_content_digest": "sha256:c5c89830c9b2a0264ea586e7cdb38e85b5575370b8a30e0fb93dfdfc2b5638da",
-      "codex_content_digest": "sha256:ec6d0b38f37399215e4c5cd52df5692ab2c2253da750b142312f7218118f2716",
-      "claude_content_digest": "sha256:b0cd0e2344d96109544ff028f71e8dbb44b05f39b0283fdccc3811062b61ca8a",
-      "cursor_content_digest": "sha256:fccfb93bb33ece421760772fea47dde91400bbfc20bb42b05529b42057548454"
+      "archive_sha256": "sha256:839f0a630ec627eff87428adf2b54faf7080a3a964a68005285ea1cb268b93d5",
+      "source_content_digest": "sha256:33d90e062f1c8fa61e226e46d1e7b717d44442b1c6a46a7e6332e8ebe66f2d78",
+      "codex_content_digest": "sha256:39583d4cc1a6266aeab86c22b60b6ffcb9666159fc68f1c66de2ee5c7a4b5b1a",
+      "claude_content_digest": "sha256:751e58ce48cc9d89d89f651207c62e2a84cd59cc0230910fe60f37584f1e3b15",
+      "cursor_content_digest": "sha256:b785de18d2eded0e00317dfa83d467c638d36f9bef989ffd55ffaff28a6362a2"
     }
   ],
   "schema": "algorover-marketplace-release-v1",

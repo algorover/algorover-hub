@@ -406,6 +406,35 @@ function writeLauncher(home, spec, platform = process.platform) {
 }
 
 const xml = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+function sameLauncher(installed, expected, platform) {
+  if (platform === "win32") return installed.replaceAll("/", "\\").toLowerCase() === expected.replaceAll("/", "\\").toLowerCase();
+  return installed === expected;
+}
+
+/** Launcher path recorded by a Windows task, or null when the action is not ours. */
+function launcherFromTaskXml(xmlText) {
+  const text = String(xmlText).replaceAll("\u0000", "").replace(/^\uFEFF/u, "");
+  const match = text.match(/<Arguments>([^<]*)<\/Arguments>/u);
+  if (!match) return null;
+  const decoded = match[1].replaceAll("&quot;", "\"").replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">");
+  return decoded.match(/"([^"]+)"/u)?.[1] ?? null;
+}
+
+function launcherFromDefinition(platform, content) {
+  if (platform === "darwin") {
+    const array = content.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u);
+    if (!array) return null;
+    const strings = [...array[1].matchAll(/<string>([^<]*)<\/string>/gu)].map((item) => item[1]);
+    return strings[1] ?? null;
+  }
+  if (platform === "linux") {
+    const match = content.match(/^ExecStart=\/bin\/sh (?:"((?:\\.|[^"])*)"|(\S+)) /mu);
+    if (!match) return null;
+    return (match[1] ?? match[2]).replaceAll("\\\\", "\\").replaceAll('\\"', '"');
+  }
+  return null;
+}
 const systemdQuote = (value) => `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%").replaceAll("$", "$$$$")}"`;
 
 /** The service definition file for one service: { path, content (string), encoding }. */
@@ -522,10 +551,24 @@ class ServiceManager {
     return /"Running"/u.test(this.run("schtasks", ["/Query", "/TN", this.#task(kind), "/FO", "CSV", "/NH"]).stdout);
   }
 
+  /** Launcher path the loaded service actually runs, or null when it cannot be read. */
+  #registeredLauncher(kind) {
+    if (this.platform === "win32") {
+      const result = this.run("schtasks", ["/Query", "/TN", this.#task(kind), "/XML"]);
+      return result.status === 0 ? launcherFromTaskXml(result.stdout) : null;
+    }
+    const definition = this.#definition(kind);
+    const bytes = currentContent(definition.path, null);
+    if (bytes === null) return null;
+    const content = definition.encoding === "utf16le" ? bytes.subarray(bytes[0] === 0xff && bytes[1] === 0xfe ? 2 : 0).toString("utf16le") : bytes.toString("utf8");
+    return launcherFromDefinition(this.platform, content);
+  }
+
   /**
    * Write the definition and load it when it is new or changed. A loaded trading
-   * service is never reloaded here: unloading it would drain every engine. Returns
-   * false when the manager is unavailable (the caller falls back to detached starts).
+   * service is not reloaded for other edits: unloading it would drain every engine.
+   * A different launcher path is another installation, so the loaded service is
+   * stopped, unregistered and replaced. Returns false when the manager is unavailable.
    */
   register(kind, { reloadLoaded = kind !== "tradingd" } = {}) {
     const definition = this.#definition(kind);
@@ -534,7 +577,12 @@ class ServiceManager {
     const current = currentContent(definition.path, null);
     const changed = current === null || Buffer.compare(current, bytes) !== 0;
     const loaded = this.registered(kind);
-    if (loaded && (!changed || !reloadLoaded)) return true;
+    const installed = loaded ? this.#registeredLauncher(kind) : null;
+    const launcherMoved = installed !== null && !sameLauncher(installed, this.launcher, this.platform);
+    if (launcherMoved) {
+      this.stop(kind);
+      this.unregister(kind);
+    } else if (loaded && (!changed || !reloadLoaded)) return true;
     try { atomicWrite(definition.path, bytes, 0o600); } catch { return false; }
     if (this.platform === "darwin") {
       if (loaded) this.run("launchctl", ["bootout", this.#label(kind)]);
@@ -635,7 +683,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.8";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.9";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";

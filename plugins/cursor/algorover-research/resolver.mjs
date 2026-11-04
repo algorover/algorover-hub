@@ -59,6 +59,11 @@ const DISCOVER_OUTPUT_SCHEMA = readDiscoverOutputSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
 const delivery = readDelivery();
+// Each platform binds its own immutable Runtime release; the plugin version only orders
+// publications, so a plugin update may keep this platform's Runtime unchanged.
+const runtimeBinding = selectRuntimeBinding();
+const boundVersion = runtimeBinding?.release_version ?? productVersion;
+const boundRuntimeIds = runtimeBinding === null ? [] : [runtimeBinding.runtime_id];
 const configuredRoot = process.env.ALGOROVER_PLUGIN_STATE_ROOT;
 if (configuredRoot !== undefined && !isAbsolute(configuredRoot)) fatal("invalid_connection_root");
 if (delivery.environment === "local" && configuredRoot === undefined) fatal("local_state_root_required");
@@ -68,7 +73,7 @@ const runtimeHome = configuredRoot === undefined ? join(homedir(), runtimeDirect
 const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`);
 const adjacentConnection = join(root, ".algorover-connection.json");
 let admittedRuntimeId = null;
-let bindingFailure = null;
+let bindingFailure = delivery.runtime_bindings.length > 0 && runtimeBinding === null ? "runtime_platform_unsupported" : null;
 
 class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -207,10 +212,10 @@ function coldOnboardingRuntimeId() {
         || (admittedRuntimeId !== null && admittedRuntimeId !== installedId)) return null;
     // An older installation still needs the target URI in the client's first tool list.
     // This advertises presentation only; resource reads retain healthyConnection admission.
-    if (delivery.expected_runtime_ids.length === 1) return delivery.expected_runtime_ids[0];
+    if (boundRuntimeIds.length === 1) return boundRuntimeIds[0];
     return matchesRelease(installedId, runtime) ? installedId : null;
   }
-  return delivery.expected_runtime_ids.length === 1 ? delivery.expected_runtime_ids[0] : null;
+  return boundRuntimeIds.length === 1 ? boundRuntimeIds[0] : null;
 }
 
 function lifecycleTools(runtimeId = null) {
@@ -407,14 +412,17 @@ function liveDashboardTargetSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"} or {kind: \"task\", view_id} (a conversation's task).",
+    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"}, {kind: \"trading_account\", venue, mode: \"demo\" | \"live\", instance_id (optional)} (the Live page at that account) or {kind: \"task\", view_id} (a conversation's task).",
     properties: {
       ...strategy.properties,
-      kind: { enum: ["strategy", "custom_strategy", "page", "task"] },
+      kind: { enum: ["strategy", "custom_strategy", "page", "task", "trading_account"] },
       custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
       revision: { type: "integer", minimum: 1, maximum: 999999 },
       page: { enum: DASHBOARD_PAGES },
       view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" },
+      venue: { type: "string", pattern: "^[A-Z][A-Z0-9_]{1,31}$" },
+      mode: { enum: ["demo", "live"] },
+      instance_id: { type: "string", pattern: "^si_[0-9a-z]{1,61}$" },
     },
     required: ["kind"],
   };
@@ -444,6 +452,17 @@ function dashboardArguments(value) {
     if (Object.keys(target).sort().join(",") !== "kind,view_id" || typeof target.view_id !== "string"
         || !/^view_[0-9a-f]{32}$/.test(target.view_id)) throw new BridgeError("invalid_tool_call");
     return { target: { kind: "task", view_id: target.view_id } };
+  }
+  // The Live page at one trading account, and one instance when given: what a monitor or incident card opens.
+  if (target.kind === "trading_account" && profile === "live") {
+    const keys = Object.keys(target).sort().join(",");
+    if ((keys !== "kind,mode,venue" && keys !== "instance_id,kind,mode,venue")
+        || typeof target.venue !== "string" || !/^[A-Z][A-Z0-9_]{1,31}$/.test(target.venue)
+        || (target.mode !== "demo" && target.mode !== "live")
+        || (keys.startsWith("instance_id") && (typeof target.instance_id !== "string" || !/^si_[0-9a-z]{1,61}$/.test(target.instance_id)))) {
+      throw new BridgeError("invalid_tool_call");
+    }
+    return { target: { ...target } };
   }
   if (target.kind === "custom_strategy" && profile === "live") {
     const keys = Object.keys(target).sort().join(",");
@@ -645,7 +664,7 @@ function readReleaseAppResource(runtimeId, resource, uri) {
     if (bytes === null || bytes.length !== metadata.size) return null;
     if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== expected[0].sha256) return null;
     const port = process.env[profile === "live" ? "ALGOROVER_LIVE_DASHBOARD_PORT" : "ALGOROVER_RESEARCH_DASHBOARD_PORT"]
-      ?? (profile === "live" ? "8787" : "8686");
+      ?? (profile === "live" ? "9797" : "9696");
     if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) return null;
     // Without a running Host the actual port is unknown; the default is a known limitation (ADR 0020).
     const origin = `http://127.0.0.1:${port}`;
@@ -722,8 +741,8 @@ async function runLifecycle(command, managementArguments = {}) {
   const channelUrl = process.env.ALGOROVER_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = validateBootstrapFile(configuredBootstrapPath());
   const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion];
-  args.push("--expected-product-version", productVersion);
-  for (const runtimeId of delivery.expected_runtime_ids) args.push("--expected-runtime-id", runtimeId);
+  args.push("--expected-product-version", boundVersion);
+  for (const runtimeId of boundRuntimeIds) args.push("--expected-runtime-id", runtimeId);
   args.push("--environment", delivery.environment);
   if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
   if (process.env.ALGOROVER_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.ALGOROVER_LIVE_STATE_ROOT);
@@ -908,7 +927,7 @@ async function runtimeStatus() {
     lifecycle: lifecycleSnapshot(),
     version: productVersion,
     plugin_version: pluginVersion,
-    expected_product_version: delivery.expected_product_version,
+    expected_product_version: boundVersion,
     runtime_version: runtime?.releaseVersion ?? null,
     runtime_contract_version: runtimeContractLabel(runtime?.contractVersion ?? null),
     runtime_id: connection?.runtime_id ?? runtimeId,
@@ -921,8 +940,8 @@ async function runtimeStatus() {
   if (executing !== null) return { ...base, state: executing === "running" ? "stopped" : "error", connection_ready: false,
     repair_allowed: false, required_action: executing === "running" ? "wait_for_runtime_status" : "inspect_runtime_status",
     message: executing === "running" ? "runtime_operation_pending" : "runtime_operation_identity_unverified" };
-  if (base.lifecycle?.selection && base.lifecycle.target_version === productVersion
-      && delivery.expected_runtime_ids.includes(base.lifecycle.selection.target_runtime_id)
+  if (base.lifecycle?.selection && base.lifecycle.target_version === boundVersion
+      && boundRuntimeIds.includes(base.lifecycle.selection.target_runtime_id)
       && ["awaiting_confirmation", "deferred"].includes(base.lifecycle.phase)) {
     return { ...base, state: base.lifecycle.phase, switch: base.lifecycle.selection, connection_ready: false,
       repair_allowed: true, required_action: base.lifecycle.phase === "awaiting_confirmation" ? "choose_runtime_switch" : null,
@@ -1058,7 +1077,7 @@ async function healthyConnection(
 }
 
 function matchesRelease(runtimeId, runtime) {
-  return runtime.releaseVersion === productVersion && (delivery.expected_runtime_ids.length === 0 || delivery.expected_runtime_ids.includes(runtimeId));
+  return runtime.releaseVersion === boundVersion && (boundRuntimeIds.length === 0 || boundRuntimeIds.includes(runtimeId));
 }
 
 function toolResult(value, isError = false) {
@@ -1168,13 +1187,35 @@ function fatal(code) {
 function readDelivery() {
   let value;
   try { value = JSON.parse(readFileSync(join(root, "delivery.json"), "utf8")); } catch { throw new BridgeError("delivery_config_missing"); }
-  if (value?.schema !== "algorover-delivery-v1" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "release" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,expected_runtime_ids,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
-  if (!Array.isArray(value.expected_runtime_ids) || value.expected_runtime_ids.some((id) => typeof id !== "string" || !/^sha256:[0-9a-f]{64}$/.test(id)) || new Set(value.expected_runtime_ids).size !== value.expected_runtime_ids.length) throw new BridgeError("delivery_config_invalid");
-  if (value.expected_runtime_ids.length === 0 && productVersion !== "0.0.0" && !existsSync(join(root, ".algorover-connection.json"))) throw new BridgeError("runtime_binding_missing");
+  if (value?.schema !== "algorover-delivery-v1" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "release" || value.product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,marketplace_origin,product,product_version,runtime_bindings,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
+  if (!validRuntimeBindings(value.runtime_bindings)) throw new BridgeError("delivery_config_invalid");
+  if (value.runtime_bindings.length === 0 && productVersion !== "0.0.0" && !existsSync(join(root, ".algorover-connection.json"))) throw new BridgeError("runtime_binding_missing");
   validateDownloadUrl(value.channel_url);
   if ((value.environment === "local") !== (new URL(value.channel_url).hostname === "127.0.0.1")) throw new BridgeError("delivery_environment_invalid");
   if (value.marketplace_origin !== null) validateDownloadUrl(value.marketplace_origin);
   return value;
+}
+
+function validRuntimeBindings(bindings) {
+  if (!Array.isArray(bindings)) return false;
+  const platforms = new Set(), runtimeIds = new Set();
+  for (const binding of bindings) {
+    if (binding === null || typeof binding !== "object" || Array.isArray(binding)
+        || Object.keys(binding).sort().join(",") !== "arch,os,release_version,runtime_id"
+        || !["macos", "windows", "linux"].includes(binding.os) || !["arm64", "amd64"].includes(binding.arch)
+        || typeof binding.release_version !== "string" || !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(binding.release_version)
+        || typeof binding.runtime_id !== "string" || !/^sha256:[0-9a-f]{64}$/.test(binding.runtime_id)) return false;
+    platforms.add(`${binding.os}-${binding.arch}`);
+    runtimeIds.add(binding.runtime_id);
+  }
+  return platforms.size === bindings.length && runtimeIds.size === bindings.length;
+}
+
+// Same platform names as Bootstrap's release directories (`releases/<version>/<os>-<arch>/`).
+function selectRuntimeBinding() {
+  const os = { darwin: "macos", win32: "windows", linux: "linux" }[process.platform];
+  const arch = { x64: "amd64", arm64: "arm64" }[process.arch];
+  return delivery.runtime_bindings.find((binding) => binding.os === os && binding.arch === arch) ?? null;
 }
 
 function readPluginVersion() {

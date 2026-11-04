@@ -1,6 +1,6 @@
 {
   "name": "algorover-research",
-  "version": "0.0.3",
+  "version": "0.0.9",
   "description": "Lightweight router for the local AlgoRover Research Runtime Host.",
   "author": {
     "name": "Rivendell Holdings Investment Limited"
