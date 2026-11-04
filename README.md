@@ -188,7 +188,7 @@ Check the [Research Guide](https://algorover.ai/en/research/) or [Live Guide](ht
 
 #### AlgoRover Live
 
-Account data and execution integrations for 14 exchanges:
+Account data and execution integrations for 13 exchanges:
 
 | Exchange / broker | Account reading | Execution integration |
 | :--- | :---: | :---: |
@@ -196,7 +196,6 @@ Account data and execution integrations for 14 exchanges:
 | <picture><source media="(prefers-color-scheme: dark)" srcset="./readme-assets/exchanges/architect-ax-white.svg"><img src="./readme-assets/exchanges/architect-ax.svg" width="24" height="24" align="absmiddle" alt=""></picture> Architect AX | ✓ | ✓ |
 | <img src="./readme-assets/exchanges/binance.svg" width="24" height="24" align="absmiddle" alt=""> Binance | ✓ | ✓ |
 | <img src="./readme-assets/exchanges/bitget.svg" width="24" height="24" align="absmiddle" alt=""> Bitget | ✓ | ✓ |
-| <img src="./readme-assets/exchanges/bitmex.png" width="24" height="24" align="absmiddle" alt=""> BitMEX | ✓ | ✓ |
 | <img src="./readme-assets/exchanges/bybit.jpg" width="24" height="24" align="absmiddle" alt=""> Bybit | ✓ | ✓ |
 | <img src="./readme-assets/exchanges/deribit.svg" width="24" height="24" align="absmiddle" alt=""> Deribit | ✓ | ✓ |
 | <img src="./readme-assets/exchanges/digifinex.jpg" width="24" height="24" align="absmiddle" alt=""> DigiFinex | ✓ | ✓ |

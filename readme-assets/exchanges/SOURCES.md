@@ -7,7 +7,6 @@ These icons identify the venues listed in the repository README. Brand names and
 | Alpaca | [Alpaca official favicon](https://files.alpaca.markets/webassets/favicon.svg) |
 | Architect AX (light and dark) | [Architect official AX brand assets](https://architect.co/brand/) |
 | Binance, Bitget, Gate.io, Kraken | [Web3 Icons branded exchange SVGs](https://github.com/0xa3k5/web3icons/tree/main/raw-svgs/exchanges/branded) |
-| BitMEX | [BitMEX official favicon](https://www.bitmex.com/favicon.ico), converted to PNG without changing the artwork |
 | Bybit | [Bybit official App Store listing](https://apps.apple.com/app/id1488296980) |
 | Deribit | [Deribit logo by Satechirohs on Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Deribit_logo.svg), CC BY-SA 4.0, unmodified |
 | DigiFinex | [DigiFinex official App Store listing](https://apps.apple.com/app/id1397735851) |
