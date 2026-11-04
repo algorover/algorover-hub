@@ -188,7 +188,7 @@ Check the [Research Guide](https://algorover.ai/en/research/) or [Live Guide](ht
 
 #### AlgoRover Live
 
-Account data and execution integrations for 14 exchanges and brokers:
+Account data and execution integrations for 14 exchanges:
 
 | Exchange / broker | Account reading | Execution integration |
 | :--- | :---: | :---: |
