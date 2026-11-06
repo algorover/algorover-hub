@@ -5,6 +5,32 @@ description: Route anonymous public strategy discovery and reproducible historic
 
 # AlgoRover Research router
 
+## Confirm the target plugin first
+
+Before any lifecycle, Dashboard or business tool call, name the target: the plugin ID, its
+environment and the Runtime version it binds. The user's install source decides it. After an
+install from the `algorover/algorover-hub` marketplace the target is the production plugin
+`algorover-research` (environment `production`). The local development plugin
+`algorover-research-local` (environment `local`, tools often shown as `algorover_research_local`) is never a
+substitute for it.
+
+- Call only tools that belong to the target plugin. When they are not in this session yet,
+  say the session must reload the plugin connection or start a new task; do not switch to the
+  local plugin's tools.
+- Every `algorover_runtime_*` result and every Dashboard result carries `plugin_id`,
+  `environment`, `plugin_version` and `runtime_version`. `ready` counts only when `plugin_id`
+  and `environment` match the target; another plugin's `ready` is not success. A Dashboard URL
+  counts only when its result carries the same identity (`structuredContent.identity`).
+  `message=environment_mismatch` means the link must not be used.
+- Report which environment and Runtime version the answer came from, for example
+  "AlgoRover Research production, Runtime 0.0.9".
+- “Plugin installed and enabled” is not “Dashboard available”. After an install, only state
+  that the plugin is installed. When the user then asks to open the Dashboard, run the whole
+  path with the target's own tools: status, start (download and install the Runtime when
+  needed), wait for `state=ready` with `connection_ready=true`, `algorover_dashboard_open`,
+  then return the link. A Runtime already running for a different environment or version
+  never shortens this path.
+
 The Node Ready Bridge always exposes `algorover_runtime_status`,
 `algorover_runtime_start`, `algorover_runtime_update` and `algorover_runtime_repair`, even
 before Runtime exists. The bridge automatically prepares the release-bound Runtime before first business use; never treat an older compatible Runtime as ready. When Runtime is ready, use the six Host meta tools:
@@ -168,6 +194,25 @@ Its text includes the current phase, download progress, last error and recent lo
 While installation is still pending, `algorover_runtime_status` text has the same progress.
 Explain the failing step and separate the evidence from your inference; do not start,
 update or repair anything unless the user asks.
+
+Three install/startup failures have a fixed explanation; name the matching one before
+anything else, quoting `cause` and `step` exactly as the diagnostics text gives them:
+- `message=node_version_unsupported`: the Node that runs this plugin is too old
+  (`node_version` versus `node_required`). Ask the user to install the current Node.js
+  LTS (22 or newer) from nodejs.org and restart Codex; nothing else works until then.
+- `channel_unavailable` whose `detail:` line has a certificate `cause`
+  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_SSL_WRONG_VERSION_NUMBER`):
+  security software or a corporate gateway intercepts HTTPS. Ask the user to turn off its
+  HTTPS scanning or allow-list the download host, then retry.
+- `channel_unavailable` with any other `cause` (`UND_ERR_CONNECT_TIMEOUT`, `ECONNRESET`,
+  `ENOTFOUND`, `ECONNREFUSED`, `REDIRECT`): the installer could not reach the download
+  source directly. It never uses a system proxy, so with `system_proxy=enabled` ask the
+  user to switch the proxy/VPN to TUN or global mode and retry; otherwise ask them to
+  change network or turn on a VPN in TUN/global mode. Without a `detail:` line, ask for
+  `algorover_runtime_diagnose` output before guessing.
+None of these come from an older installation or a previous product name; do not send
+the user to delete old directories.
 
 ## Upgrade recovery
 

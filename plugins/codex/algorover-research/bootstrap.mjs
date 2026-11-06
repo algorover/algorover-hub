@@ -683,7 +683,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.9";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.10";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -2111,6 +2111,37 @@ function retryableDownload(error) {
   return error instanceof BootstrapError && ["download_interrupted", "download_timeout", "channel_unavailable"].includes(error.code);
 }
 
+// A failed download keeps the Node fetch cause (ENOTFOUND, ECONNRESET, UND_ERR_CONNECT_TIMEOUT,
+// certificate codes), the step it failed in and whether Windows has a system proxy on, so the
+// user can be told DNS, blocked network, TLS interception and proxy-mode problems apart. The
+// error code itself stays channel_unavailable.
+function downloadStep(url) {
+  let path = "";
+  try { path = new URL(url).pathname; } catch { /* the step name is only a hint */ }
+  if (path.endsWith("/RUNTIME.json")) return "manifest";
+  if (path.endsWith("/runtime.zip")) return "archive";
+  return "channel";
+}
+
+function windowsSystemProxyState() {
+  if (process.platform !== "win32") return null;
+  try {
+    const result = spawnSync(windowsSystemExecutable("reg.exe"),
+      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyEnable"],
+      { encoding: "utf8", timeout: 5000, windowsHide: true });
+    if (result.status !== 0) return null;
+    return /ProxyEnable\s+REG_DWORD\s+0x0*1\b/iu.test(result.stdout) ? "enabled" : "disabled";
+  } catch { return null; }
+}
+
+function downloadFailureDetails(url, error) {
+  const cause = error?.cause ?? error;
+  const code = typeof cause?.code === "string" && cause.code
+    ? cause.code
+    : /unexpected redirect/iu.test(String(cause?.message ?? "")) ? "REDIRECT" : String(cause?.name ?? "unknown");
+  return { cause: code, step: downloadStep(url), system_proxy: windowsSystemProxyState() };
+}
+
 function resumableArchivePath(directory, url) {
   return join(directory, `runtime-${createHash("sha256").update(String(url)).digest("hex").slice(0, 32)}.partial`);
 }
@@ -2208,7 +2239,8 @@ async function downloadOnce(parsed, destination, maximumBytes, signal, resume, r
   try {
     response = await fetch(parsed, { redirect: "error", signal: requestSignal, ...(headers === undefined ? {} : { headers }) });
   } catch (error) {
-    fail(error?.name === "TimeoutError" || signal.aborted ? "download_timeout" : "channel_unavailable", "Runtime source is unavailable");
+    const timedOut = error?.name === "TimeoutError" || signal.aborted;
+    throw new BootstrapError(timedOut ? "download_timeout" : "channel_unavailable", "Runtime source is unavailable", downloadFailureDetails(parsed, error));
   }
   if (response.status === 416) {
     rmSync(destination, { force: true });
@@ -3015,6 +3047,10 @@ export function formatBootstrapError(error) {
   if (code === "runtime_identity_invalid" && error instanceof BootstrapError && Array.isArray(error.details?.paths)) {
     for (const path of error.details.paths) lines.push(`AlgoRover bootstrap path: ${path}`);
     lines.push("AlgoRover bootstrap: rerun gc with --force yes to delete these releases");
+  }
+  if (["channel_unavailable", "download_timeout"].includes(code) && error instanceof BootstrapError && error.details !== null) {
+    const { cause, step, system_proxy } = error.details;
+    lines.push(`AlgoRover bootstrap detail: cause=${cause} step=${step} system_proxy=${system_proxy ?? "unknown"}`);
   }
   if (code === "runtime_path_too_long" && error instanceof BootstrapError && error.details !== null) {
     const { length, limit, required_reduction, runtime_id, directory, path } = error.details;
