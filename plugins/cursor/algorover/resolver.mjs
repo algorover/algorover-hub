@@ -59,6 +59,9 @@ const DISCOVER_OUTPUT_SCHEMA = readDiscoverOutputSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
 const delivery = readDelivery();
+// Every status and Dashboard result repeats this identity, so another environment's "ready"
+// (for example the local development plugin's) is never mistaken for this plugin's.
+const pluginId = delivery.environment === "local" ? `algorover-${profile}-local` : `algorover-${profile}`;
 // Each platform binds its own immutable Runtime release; the plugin version only orders
 // publications, so a plugin update may keep this platform's Runtime unchanged.
 const runtimeBinding = selectRuntimeBinding();
@@ -74,6 +77,10 @@ const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`)
 const adjacentConnection = join(root, ".algorover-connection.json");
 let admittedRuntimeId = null;
 let bindingFailure = delivery.runtime_bindings.length > 0 && runtimeBinding === null ? "runtime_platform_unsupported" : null;
+// The Node that runs this bridge also runs Bootstrap. Older Nodes lack the fetch and stream
+// APIs Bootstrap needs and would fail without a readable cause, so refuse them up front.
+const MINIMUM_NODE_MAJOR = 20;
+const nodeFailure = Number.parseInt(process.versions.node, 10) < MINIMUM_NODE_MAJOR ? "node_version_unsupported" : null;
 
 class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -141,7 +148,11 @@ async function handleRequest(request) {
       });
     }
     if (name === "algorover_dashboard_open") {
-      return resultResponse(id, dashboardOpenResult(await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue))));
+      const opened = await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue));
+      // The link counts only when this plugin's own bound Runtime still serves it.
+      const identity = await boundIdentity();
+      if (identity === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), state: "error", connection_ready: false, message: "environment_mismatch", required_action: "inspect_runtime_status" }, true));
+      return resultResponse(id, dashboardOpenResult(opened, identity));
     }
     if (name === "algorover_redeem_code_open") return resultResponse(id, await executeRedeemCodeOpen(argumentsValue));
     if (name in LIFECYCLE_HANDLERS) {
@@ -229,6 +240,8 @@ function lifecycleTools(runtimeId = null) {
       state: { enum: ["ready", "stopped", "not_installed", "update_required", "awaiting_confirmation", "deferred", "stale_session", "error"] },
       switch: { type: ["object", "null"] },
       profile: { enum: ["live", "research"] },
+      plugin_id: { type: "string" },
+      environment: { enum: ["production", "local"] },
       plugin_version: { type: "string" },
       version: { type: "string" },
       expected_product_version: { type: "string" },
@@ -241,12 +254,14 @@ function lifecycleTools(runtimeId = null) {
       repair_allowed: { type: "boolean" },
       required_action: { type: ["string", "null"] },
       message: { type: ["string", "null"] },
+      node_version: { type: "string" },
+      node_required: { type: "string" },
     },
-    required: ["state", "profile", "version", "plugin_version", "expected_product_version", "runtime_version", "runtime_contract_version", "runtime_id", "bootstrap_installed", "connection_ready", "repair_allowed", "required_action", "message"],
+    required: ["state", "profile", "plugin_id", "environment", "version", "plugin_version", "expected_product_version", "runtime_version", "runtime_contract_version", "runtime_id", "bootstrap_installed", "connection_ready", "repair_allowed", "required_action", "message"],
     additionalProperties: false,
   };
   const definitions = [
-    ["algorover_runtime_status", "Runtime Status", "Inspect local AlgoRover Runtime and Host readiness without starting them. The text includes the current phase, download progress, last error, and recent redacted log lines.", true],
+    ["algorover_runtime_status", "Runtime Status", "Inspect local AlgoRover Runtime and Host readiness without starting them. Reports plugin_id, environment (production or local), plugin_version and runtime_version; only a result whose plugin_id and environment match the plugin you meant to use counts as ready. The text includes the current phase, download progress, last error, and recent redacted log lines.", true],
     ["algorover_runtime_start", "Runtime Start", "Download/install when needed and start the local AlgoRover Runtime Host.", false],
     ["algorover_runtime_update", "Runtime Update", "Update to the channel Runtime and restart the local Host.", false],
     ["algorover_runtime_repair", "Runtime Repair", "Reinstall the channel Runtime and restart the local Host.", false],
@@ -484,12 +499,21 @@ function dashboardArguments(value) {
 
 // Clients that only show content text never see structuredContent. Put the exact
 // loopback URL there; keep the structured result for clients that prefer it.
-function dashboardOpenResult(result) {
+function dashboardOpenResult(result, identity) {
   const outcomes = result?.structuredContent?.outcomes;
   const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
   const url = outcome?.output?.url;
   if (outcome?.operation_id !== "dashboard.open" || outcome?.status !== "completed" || !dashboardLoopbackUrl(url)) return result;
-  return { ...result, content: [{ type: "text", text: url }] };
+  return { ...result, content: [{ type: "text", text: url }], structuredContent: { ...result.structuredContent, identity: { ...identity, dashboard_url: url } } };
+}
+
+// The plugin and Runtime a Dashboard link belongs to; null unless the bound Runtime is connected.
+async function boundIdentity() {
+  const runtimeId = readInstalledRuntimeId();
+  const runtime = readInstalledRuntime(runtimeId);
+  const connection = await healthyConnection(runtimeId, runtime);
+  if (connection === null || runtime === null) return null;
+  return { plugin_id: pluginId, environment: delivery.environment, plugin_version: pluginVersion, runtime_version: runtime.releaseVersion, runtime_id: connection.runtime_id };
 }
 
 function dashboardLoopbackUrl(value) {
@@ -736,6 +760,7 @@ async function executeHostOperation(operationId, argumentsValue, timeoutMs = MCP
 async function runLifecycle(command, managementArguments = {}) {
   const before = await runtimeStatus();
   if (before.state === "stale_session") return before;
+  if (before.message === "node_version_unsupported") return before;
   if (before.message === "runtime_operation_pending") return before;
   if (new Set(["update", "repair"]).has(command) && !before.repair_allowed) return staleSession(before);
   const channelUrl = process.env.ALGOROVER_CHANNEL_URL ?? delivery.channel_url;
@@ -808,7 +833,7 @@ function lifecycleSnapshot() {
 }
 
 const DIAGNOSE_TAIL_BYTES = 256 * 1024;
-const DIAGNOSE_PROBLEM = /error|exception|traceback|failed|failure|denied|refused|timed? ?out|killed|invalid|mismatch|unavailable|AlgoRover bootstrap:/iu;
+const DIAGNOSE_PROBLEM = /error|exception|traceback|failed|failure|denied|refused|timed? ?out|killed|invalid|mismatch|unavailable|AlgoRover bootstrap/iu;
 
 // Read-only install/startup evidence; the Host MCP may be unavailable here.
 async function runtimeDiagnosis() {
@@ -924,6 +949,8 @@ async function runtimeStatus() {
   const connection = incompatible || executing !== null ? null : await healthyConnection(runtimeId, runtime);
   const base = {
     profile,
+    plugin_id: pluginId,
+    environment: delivery.environment,
     lifecycle: lifecycleSnapshot(),
     version: productVersion,
     plugin_version: pluginVersion,
@@ -934,6 +961,8 @@ async function runtimeStatus() {
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
   };
+  if (nodeFailure !== null) return { ...base, state: "error", connection_ready: false, repair_allowed: false,
+    required_action: "install_node", message: nodeFailure, node_version: process.versions.node, node_required: `>=${MINIMUM_NODE_MAJOR}` };
   if (bindingFailure !== null) return { ...base, state: "stale_session", connection_ready: false,
     repair_allowed: false, required_action: "update_plugin_and_reload", message: bindingFailure };
   if (incompatible || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
@@ -1093,11 +1122,11 @@ function toolResult(value, isError = false) {
     ? "The target Runtime is prepared. Show the listed old processes/tasks and ask once: defer the switch, or stop the listed old version and continue. Stopping programs does not guarantee cancelling orders or closing positions. Only after that explicit choice call the same lifecycle tool with action, operation_id and snapshot_digest. Do not open the old Dashboard or onboarding as target success."
     : value?.state === "deferred" ? "Runtime switch deferred. The old environment is preserved; this target startup request has ended."
     : pending
-    ? `AlgoRover Runtime installation or startup is still pending.${decisionText(value)}${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
+    ? `AlgoRover Runtime installation or startup is still pending.${identityText(value)}${decisionText(value)}${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
     : unfinished
-      ? `AlgoRover Runtime is not ready.${decisionText(value)}${lifecycleText}${recent} Follow required_action before opening Dashboard or onboarding.`
+      ? `AlgoRover Runtime is not ready.${identityText(value)}${decisionText(value)}${lifecycleText}${recent} Follow required_action before opening Dashboard or onboarding.`
       : value?.state === "ready"
-        ? "AlgoRover Runtime is ready. Installation and startup have completed; Dashboard and onboarding may now be opened."
+        ? `AlgoRover Runtime is ready.${identityText(value)} Installation and startup have completed; Dashboard and onboarding may now be opened. This ready belongs only to that plugin_id and environment; a ready from any other plugin (for example the local development plugin) is not this plugin's.`
         : "AlgoRover Runtime operation completed.";
   return {
     content: [{ type: "text", text }],
@@ -1106,11 +1135,17 @@ function toolResult(value, isError = false) {
   };
 }
 
+function identityText(value) {
+  if (typeof value?.plugin_id !== "string") return "";
+  return ` plugin_id=${value.plugin_id} environment=${value.environment} plugin_version=${value.plugin_version} runtime_version=${value.runtime_version ?? "none"}.`;
+}
+
 function decisionText(value) {
   if (typeof value?.state !== "string" || value.state === "ready") return "";
   const message = typeof value.message === "string" && value.message ? ` message=${value.message}` : "";
   const action = typeof value.required_action === "string" && value.required_action ? ` required_action=${value.required_action}` : "";
-  return ` state=${value.state}${message}${action}.`;
+  const node = typeof value.node_version === "string" ? ` node_version=${value.node_version} node_required=${value.node_required}` : "";
+  return ` state=${value.state}${message}${action}${node}.`;
 }
 
 function installProgressText(lifecycle) {
