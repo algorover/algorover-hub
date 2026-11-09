@@ -3,6 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, open
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { connect } from "node:net";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -93,6 +94,16 @@ async function handleRequest(request) {
   const notification = !Object.hasOwn(request, "id");
   if (notification) return null;
   const id = request.id;
+  if (request.method === "tools/call" && request.params?.name === "algorover_runtime_target") {
+    const argumentsValue = request.params?.arguments ?? {};
+    if (!isPlainObject(argumentsValue)) return errorResponse(id, -32602, "invalid_tool_call");
+    return resultResponse(id, await executeRuntimeTarget(argumentsValue));
+  }
+  // On the VPS (ADR 0031), or after a switch in this process, the remote path answers.
+  if (remoteTarget !== null || placementSwitched) {
+    const response = await handleRemoteRequest(request);
+    if (response !== undefined) return response;
+  }
   if (request.method === "initialize") {
     return resultResponse(id, {
       protocolVersion: MCP_PROTOCOL_VERSION,
@@ -102,6 +113,7 @@ async function handleRequest(request) {
         version: productVersion,
         ...(readInstalledRuntimeId() === null ? {} : { runtimeId: readInstalledRuntimeId() }),
       },
+      instructions: placementInstructions(),
     });
   }
   if (request.method === "ping") return resultResponse(id, {});
@@ -254,6 +266,7 @@ function lifecycleTools(runtimeId = null) {
       repair_allowed: { type: "boolean" },
       required_action: { type: ["string", "null"] },
       message: { type: ["string", "null"] },
+      placement: { enum: ["local", "remote"] },
       node_version: { type: "string" },
       node_required: { type: "string" },
     },
@@ -310,6 +323,7 @@ function lifecycleTools(runtimeId = null) {
     inputSchema: dashboardSchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   });
+  tools.push(runtimeTargetTool());
   return tools;
 }
 
@@ -960,6 +974,8 @@ async function runtimeStatus() {
     runtime_id: connection?.runtime_id ?? runtimeId,
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
+    // The VPS copy of this bridge runs with ALGOROVER_RUNTIME_PLACEMENT=remote (ADR 0031).
+    placement: process.env.ALGOROVER_RUNTIME_PLACEMENT === "remote" ? "remote" : "local",
   };
   if (nodeFailure !== null) return { ...base, state: "error", connection_ready: false, repair_allowed: false,
     required_action: "install_node", message: nodeFailure, node_version: process.versions.node, node_required: `>=${MINIMUM_NODE_MAJOR}` };
@@ -1270,7 +1286,7 @@ function configuredBootstrapPath() {
 }
 
 function lifecycleProcessEnvironment() {
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "ALGOROVER_ENV", "ALGOROVER_LIVE_DASHBOARD_PORT", "ALGOROVER_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ALGOROVER_PROXY_URL", "ALGOROVER_PROXY_MODE", "XDG_RUNTIME_DIR", "TMPDIR", "USERNAME", "USERDOMAIN", "ALGOROVER_SERVICE_MODE"]).has(key.toUpperCase())));
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "ALGOROVER_ENV", "ALGOROVER_LIVE_DASHBOARD_PORT", "ALGOROVER_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ALGOROVER_PROXY_URL", "ALGOROVER_PROXY_MODE", "XDG_RUNTIME_DIR", "TMPDIR", "USERNAME", "USERDOMAIN", "ALGOROVER_SERVICE_MODE", "ALGOROVER_RUNTIME_PLACEMENT"]).has(key.toUpperCase())));
   const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
   if (names.length === 0) environment.NO_PROXY = "127.0.0.1";
   else for (const name of names) {
@@ -1323,6 +1339,1311 @@ function validateDownloadUrl(value) {
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new BridgeError("download_url_invalid");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Remote placement (ADR 0031): this product's Runtime runs on the user's own VPS. This bridge then
+// speaks MCP to a same-version copy of itself on the VPS over SSH, so the remote copy still sees
+// a loopback Runtime and keeps every check it makes. Only one side runs at a time: switching
+// refuses open trading work, stops the other side's services and keeps its install. The
+// Dashboard opens through an SSH tunnel on the same loopback port, so links and cards work.
+// deploy_to_vps prepares the VPS from what the user gives in the conversation (address, user
+// and password or a key file): it installs this product's own SSH key, Node.js, linger and,
+// for root, a service user, so that every later connection logs in with that key.
+// ---------------------------------------------------------------------------------------------
+const REMOTE_TARGET_SCHEMA = "algorover-remote-target-v1";
+const REMOTE_RESULT_SCHEMA = "algorover-runtime-target-v1";
+const remoteRoot = join(runtimeHome, "remote");
+const remoteTargetPath = join(remoteRoot, "target.json");
+const remoteKnownHosts = join(remoteRoot, "known_hosts");
+const remoteKeyPath = join(remoteRoot, "id_ed25519");
+const remoteTunnelsPath = join(remoteRoot, "tunnels.json");
+// Ports a VPS Host of this product may serve its page on (default and fallback, ADR 0020).
+const REMOTE_DASHBOARD_PORTS = profile === "live" ? [9797, 19797] : [9696, 19696];
+const REMOTE_CONNECT_TIMEOUT_MS = 60_000;
+const REMOTE_LIST_TIMEOUT_MS = 60_000;
+// Same budget as the plugin's tool_timeout_sec (1260 s): a remote install can take minutes.
+const REMOTE_CALL_TIMEOUT_MS = 1_250_000;
+const REMOTE_COMMAND_TIMEOUT_MS = 240_000;
+const REMOTE_MAX_LINE_BYTES = 2 * 1024 * 1024;
+const MIGRATION_MAX_BYTES = 64 * 1024 * 1024;
+const MIGRATION_MAX_FILE_BYTES = 16 * 1024 * 1024;
+// Aliases only remain readable in targets saved by earlier versions of this plugin.
+const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const SSH_HOST = /^(?:[A-Za-z0-9][A-Za-z0-9.-]{0,252}|[0-9A-Fa-f:]{2,39})$/;
+const SSH_USER = /^[A-Za-z_][A-Za-z0-9_.-]{0,31}$/;
+const REMOTE_COPY_NAME = /^[0-9A-Za-z.+_-]{1,96}$/;
+const MINIMUM_REMOTE_GLIBC = [2, 35];
+// The same floor as the bundled bootstrap (bootstrap.mjs::MINIMUM_NODE_MAJOR): an older Node would pass here and fail there.
+const MINIMUM_REMOTE_NODE = 20;
+const MINIMUM_REMOTE_DISK_BYTES = 3 * 1024 ** 3;
+// The non-root user a Runtime runs as when the user gives root.
+const REMOTE_SERVICE_USER = "algorover";
+// Node.js installed into ~/.algorover-remote/node when the VPS has none (or an older one):
+// the current LTS, verified against this digest whichever source answers.
+const REMOTE_NODE = { version: "24.22.2", file: "node-v24.22.2-linux-x64.tar.gz",
+  sha256: "361718c444e49af2ca5a110c83ba6a8901143f23ab285ebbef0341f391f482a9" };
+const MAXIMUM_PASSWORD_FAILURES = 2;
+// Remote files of one plugin copy: the bridge itself, its bundled bootstrap and the data they read.
+const REMOTE_PLUGIN_FILES = ["resolver.mjs", "bootstrap.mjs", "delivery.json", ".codex-plugin/plugin.json",
+  "strategy-discover-input.json", "strategy-discover-output.json"];
+const LIFECYCLE_TOOL_NAMES = new Set(["algorover_runtime_start", "algorover_runtime_update", "algorover_runtime_repair"]);
+const PRODUCT_NAME = profile === "live" ? "Live" : "Research";
+
+let remoteTarget = readRemoteTarget();
+let remoteChannel = null;
+// Set when this process switched away from a Runtime the conversation already used: like a
+// replaced Runtime (stale_session) it must continue in a new conversation.
+let placementSwitched = false;
+let remoteAdmittedRuntimeId = null;
+let remoteStale = false;
+let remoteToolAnnotations = new Map();
+// Rejected passwords per VPS in this conversation; servers often ban an address after a few.
+const passwordFailures = new Map();
+
+function runtimeTargetTool() {
+  const secret = { type: "string", minLength: 1, maxLength: 512 };
+  return {
+    name: "algorover_runtime_target", title: "Runtime Location",
+    description: [
+      `Choose where this AlgoRover ${PRODUCT_NAME} Runtime runs: on this computer (default) or on the user's own Linux VPS (Ubuntu 22.04/24.04 or similar, x86_64), which keeps strategies running while the computer is off. Only one side runs at a time.`,
+      "status: the current location.",
+      "deploy_to_vps: ask the user once for the VPS address, SSH port (22 when not given), user name and password, or instead of the password the path of a private key file on this computer (such as a cloud provider's .pem). Pass them exactly as given and never repeat the password in a reply. The first call checks the VPS (it only copies this plugin there) and changes nothing else; it returns needs_input (ask only for the listed items, then call again with all arguments), unsuitable (explain why), refused (explain what to do first) or awaiting_confirmation with a plan. Show the plan and only after the user agrees call deploy_to_vps again with the same arguments plus confirmation: it prepares the VPS (AlgoRover's own SSH key, Node.js, background services, a separate user when given root), installs and starts the Runtime there and, when this computer has one, copies the user's strategies to the VPS and stops the Runtime here. When a step fails, calling deploy_to_vps again continues from it.",
+      "switch_to_local: first returns awaiting_confirmation with a summary and a confirmation digest; only after the user agrees call it again with confirmation. Switching is refused while strategies run or hold positions or a background task runs. force=true is only for a VPS that cannot be reached, after warning that its strategies may still run.",
+      "When a result's required_action is new_conversation, tell the user to start a new conversation and do not call other AlgoRover tools in this one.",
+    ].join(" "),
+    inputSchema: { type: "object", additionalProperties: false, required: ["action"], properties: {
+      action: { enum: ["status", "deploy_to_vps", "switch_to_local"] },
+      host: { type: "string", pattern: SSH_HOST.source },
+      port: { type: "integer", minimum: 1, maximum: 65535 },
+      user: { type: "string", pattern: SSH_USER.source },
+      password: secret,
+      sudo_password: secret,
+      key_file: { type: "string", minLength: 1, maxLength: 1024 },
+      allow_not_durable: { type: "boolean" },
+      reset_host_key: { type: "boolean" },
+      confirmation: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+      force: { type: "boolean" },
+    } },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  };
+}
+
+// One sentence the client gives the model at the start of every conversation.
+function placementInstructions() {
+  const where = remoteTarget === null ? "this computer" : `the user's VPS ${destinationLabel(remoteTarget.destination)}`;
+  return `AlgoRover ${PRODUCT_NAME} runs on ${where}. Say so when reporting the Runtime status or opening the Dashboard. To change it, use algorover_runtime_target.`;
+}
+
+// --- persisted state -----------------------------------------------------------------------
+
+function readPrivateJson(path, maximumBytes = 64 * 1024) {
+  let metadata;
+  try { metadata = lstatSync(path); } catch { return null; }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > maximumBytes) return null;
+  if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) return null;
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+}
+
+function writePrivateJson(path, value) {
+  mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+function validDestination(value) {
+  if (!isPlainObject(value)) return null;
+  const keys = Object.keys(value).sort().join(",");
+  if (keys === "alias" && typeof value.alias === "string" && SSH_ALIAS.test(value.alias)) return { alias: value.alias };
+  if (keys === "host,port,user" && typeof value.host === "string" && SSH_HOST.test(value.host)
+      && Number.isSafeInteger(value.port) && value.port >= 1 && value.port <= 65535
+      && typeof value.user === "string" && SSH_USER.test(value.user)) return { host: value.host, port: value.port, user: value.user };
+  return null;
+}
+
+function sameDestination(left, right) {
+  return left !== null && right !== null && JSON.stringify(left) === JSON.stringify(validDestination(right));
+}
+
+function destinationLabel(destination) {
+  return destination === null ? null : destination.alias ?? `${destination.user}@${destination.host}${destination.port === 22 ? "" : `:${destination.port}`}`;
+}
+
+function readRemoteTarget() {
+  const value = readPrivateJson(remoteTargetPath);
+  if (value === null || value.schema !== REMOTE_TARGET_SCHEMA || value.profile !== profile) return null;
+  const destination = validDestination(value.destination);
+  return destination === null ? null : { destination, activated_at: typeof value.activated_at === "string" ? value.activated_at : null,
+    check: isPlainObject(value.check) ? value.check : null };
+}
+
+// --- SSH -----------------------------------------------------------------------------------
+
+// ssh parses -o values itself: forward slashes and quotes keep Windows and spaced paths intact.
+function sshPath(path) {
+  const value = process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+  return /[\s"]/u.test(value) ? `"${value.replaceAll('"', '\\"')}"` : value;
+}
+
+// How a connection logs in. batch: this product's key (once installed) and the user's own SSH
+// keys, never a prompt. key_file: only the given private key. password: only the password,
+// answered from memory through SSH_ASKPASS (withAskpass).
+const BATCH = { mode: "batch" };
+
+function sshOptions({ knownHosts = remoteKnownHosts, hostKeys = "yes", forwarding = false, auth = BATCH } = {}) {
+  const login = auth.mode === "password"
+    ? ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "NumberOfPasswordPrompts=1"]
+    : auth.mode === "key_file"
+      ? ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", sshPath(auth.path)]
+      : ["-o", "BatchMode=yes", ...(existsSync(remoteKeyPath) ? ["-i", sshPath(remoteKeyPath)] : [])];
+  return ["-T", ...login, "-o", `StrictHostKeyChecking=${hostKeys}`,
+    "-o", `UserKnownHostsFile=${sshPath(knownHosts)}`, "-o", `GlobalKnownHostsFile=${sshPath(knownHosts)}`,
+    "-o", "UpdateHostKeys=no", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+    "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+    "-o", "PermitLocalCommand=no", "-o", "RequestTTY=no", "-o", "LogLevel=ERROR",
+    ...(forwarding ? ["-o", "ExitOnForwardFailure=yes"] : ["-o", "ClearAllForwardings=yes"])];
+}
+
+function sshDestination(destination) {
+  return destination.alias !== undefined ? [destination.alias] : ["-p", String(destination.port), "-l", destination.user, destination.host];
+}
+
+function sshEnvironment(extra = {}) {
+  // ssh needs the user's own environment (HOME, SSH_AUTH_SOCK, PATH); nothing else is passed on.
+  return { ...process.env, ...extra };
+}
+
+function runProcess(command, args, { input = null, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS, maximumBytes = 8 * 1024 * 1024, env = sshEnvironment() } = {}) {
+  return new Promise((accept) => {
+    let child;
+    try {
+      child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env });
+    } catch { accept({ status: null, stdout: "", stderr: "", missing: true }); return; }
+    const out = [], err = [];
+    let outBytes = 0, errBytes = 0;
+    child.stdout.on("data", (chunk) => { outBytes += chunk.length; if (outBytes <= maximumBytes) out.push(chunk); });
+    child.stderr.on("data", (chunk) => { errBytes += chunk.length; if (errBytes <= 256 * 1024) err.push(chunk); });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.once("error", (error) => { clearTimeout(timer); accept({ status: null, stdout: "", stderr: "", missing: error?.code === "ENOENT" }); });
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      accept({ status, stdout: outBytes <= maximumBytes ? Buffer.concat(out).toString("utf8") : "", stderr: Buffer.concat(err).toString("utf8"),
+        truncated: outBytes > maximumBytes, timedOut: status === null });
+    });
+    child.stdin.on("error", () => { /* the remote side may exit before reading everything */ });
+    child.stdin.end(input ?? undefined);
+  });
+}
+
+// ssh asks SSH_ASKPASS for the password; the helper prints it from a private file that exists
+// only while this one ssh runs. The password never appears in arguments or the environment.
+async function withAskpass(password, run) {
+  mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+  const directory = join(remoteRoot, `askpass-${randomUUID()}`);
+  mkdirSync(directory, { mode: 0o700 });
+  try {
+    const secret = join(directory, "secret");
+    writeFileSync(secret, password, { mode: 0o600 });
+    const helper = join(directory, process.platform === "win32" ? "askpass.cmd" : "askpass");
+    writeFileSync(helper, process.platform === "win32" ? `@type "${secret}"\r\n` : `#!/bin/sh\nexec cat "${secret.replaceAll('"', '\\"')}"\n`, { mode: 0o700 });
+    return await run({ SSH_ASKPASS: helper, SSH_ASKPASS_REQUIRE: "force", DISPLAY: process.env.DISPLAY || ":0" });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+// One fixed POSIX script run by the VPS user's login shell. It finds Node (the copy this plugin
+// installs first, then PATH and the usual locations a non-interactive SSH shell misses) and never
+// contains user input: data travels on stdin.
+function remoteShell(body, { node = true } = {}) {
+  const findNode = "N=\"\"; for c in \"$HOME\"/.algorover-remote/node/bin/node \"$(command -v node 2>/dev/null)\" /usr/local/bin/node /usr/bin/node \"$HOME\"/.nvm/versions/node/*/bin/node \"$HOME\"/.volta/bin/node \"$HOME\"/.local/bin/node; do if [ -z \"$N\" ] && [ -n \"$c\" ] && [ -x \"$c\" ]; then N=\"$c\"; fi; done; [ -n \"$N\" ] || { echo \"AlgoRover remote: node_missing\" >&2; exit 3; }; ";
+  const script = (node ? findNode : "") + body;
+  if (script.includes("'")) throw new BridgeError("remote_command_invalid");
+  return `/bin/sh -c '${script}'`;
+}
+
+function remoteCopyName() {
+  const name = `${pluginVersion}-${remoteBundle().digest.slice(0, 12)}`;
+  if (!REMOTE_COPY_NAME.test(name)) throw new BridgeError("remote_copy_name_invalid");
+  return name;
+}
+
+function remoteCopyDirectory() { return `"$HOME/.algorover-remote/${profile}/${remoteCopyName()}"`; }
+
+async function runSsh(destination, command, { input = null, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS, hostKeys = "yes", knownHosts = remoteKnownHosts, auth = BATCH } = {}) {
+  mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+  const args = [...sshOptions({ hostKeys, knownHosts, auth }), ...sshDestination(destination), command];
+  const result = auth.mode === "password"
+    ? await withAskpass(auth.password, (extra) => runProcess("ssh", args, { input, timeoutMs, env: sshEnvironment(extra) }))
+    : await runProcess("ssh", args, { input, timeoutMs });
+  return { ...result, code: result.status === 0 ? null : sshFailureCode(result) };
+}
+
+function sshFailureCode(result) {
+  if (result.missing) return "ssh_missing";
+  if (result.timedOut) return "ssh_timeout";
+  const stderr = String(result.stderr ?? "");
+  const own = /AlgoRover (?:remote|bootstrap): ([a-z0-9_]+)/u.exec(stderr)?.[1];
+  if (own) return own;
+  if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key for .* has changed|host key .* differs/iu.test(stderr)) return "ssh_host_key_changed";
+  if (/Host key verification failed|No .*host key is known|host key is not known/iu.test(stderr)) return "ssh_host_key_unknown";
+  if (/Permission denied|Too many authentication failures|no more authentication methods|Authentication failed/iu.test(stderr)) return "ssh_auth_failed";
+  if (/Could not resolve hostname|Name or service not known|nodename nor servname|No such host/iu.test(stderr)) return "ssh_host_not_found";
+  if (/Connection refused/iu.test(stderr)) return "ssh_connection_refused";
+  if (/timed out|Operation timed out|Network is unreachable|No route to host/iu.test(stderr)) return "ssh_timeout";
+  if (/Connection closed|Connection reset|kex_exchange_identification/iu.test(stderr)) return "ssh_connection_closed";
+  if (/Bad configuration option|Bad owner or permissions|unknown option|Unsupported option|Can't open user config|Load key .*: (?:invalid format|bad permissions)/iu.test(stderr)) return "ssh_config_invalid";
+  return result.status === 255 ? "ssh_failed" : "remote_command_failed";
+}
+
+const SSH_GUIDANCE = {
+  ssh_missing: "This computer has no ssh command. Install the OpenSSH client (built into macOS, Linux and Windows 10+).",
+  ssh_auth_failed: "The VPS refused the login: check the user name and the password (or key file) with the user, then call deploy_to_vps again.",
+  ssh_host_key_changed: "The VPS presents a different identity (host key) than before. If the user reinstalled or replaced this server, call deploy_to_vps again with reset_host_key=true; otherwise stop and ask the user to check with their VPS provider.",
+  ssh_host_not_found: "The VPS address cannot be resolved. Check the address with the user.",
+  ssh_connection_refused: "The VPS refused the SSH connection. Check the port (often 22) with the user and that SSH runs on the server.",
+  ssh_connection_closed: "The VPS closed the SSH connection. The server may block this address after failed logins, or only allow other networks; check with the user or the VPS provider.",
+  ssh_timeout: "The VPS did not answer in time. Check the address and port, the network (a server on an internal network needs this computer on the same network or VPN) and the VPS firewall.",
+  ssh_config_invalid: "ssh rejected its configuration or the key file; check the key file path with the user.",
+  node_missing: "The VPS has no usable Node.js; call deploy_to_vps, which installs it.",
+  node_too_old: `The VPS Node.js is older than ${MINIMUM_REMOTE_NODE}; call deploy_to_vps, which installs a current one.`,
+};
+
+function guidance(code) { return SSH_GUIDANCE[code] ?? STEP_TEXT[code] ?? "Check the VPS and try again."; }
+
+async function hostKeyFingerprints(path) {
+  if (!existsSync(path)) return [];
+  const result = await runProcess("ssh-keygen", ["-l", "-E", "sha256", "-f", path], { timeoutMs: 15_000 });
+  if (result.status !== 0) return [];
+  return [...new Set(result.stdout.split(/\r?\n/u).flatMap((line) => {
+    const match = /^\d+\s+(SHA256:[A-Za-z0-9+/]{43})\s+.*\((\w+)\)\s*$/u.exec(line.trim());
+    return match ? [`${match[1]} (${match[2]})`] : [];
+  }))];
+}
+
+// This product's own key on this computer: the VPS trusts it once deploy_to_vps installed it.
+async function pluginPublicKey() {
+  if (!existsSync(remoteKeyPath)) {
+    mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+    const created = await runProcess("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", `algorover-${profile}`, "-f", remoteKeyPath], { timeoutMs: 30_000 });
+    if (created.status !== 0) throw new BridgeError(created.missing ? "ssh_missing" : "ssh_key_create_failed");
+  }
+  const line = readFileSync(`${remoteKeyPath}.pub`, "utf8").trim().split(/\s+/u).slice(0, 3).join(" ");
+  if (!/^ssh-ed25519 [A-Za-z0-9+/=]+(?: [A-Za-z0-9@._-]+)?$/u.test(line)) throw new BridgeError("ssh_key_invalid");
+  return line;
+}
+
+// --- plugin copy and remote checks ---------------------------------------------------------
+
+let cachedBundle = null;
+function remoteBundle() {
+  if (cachedBundle !== null) return cachedBundle;
+  const files = REMOTE_PLUGIN_FILES.map((path) => {
+    const bytes = readBoundedRegularFile(join(root, ...path.split("/")), MAX_BOOTSTRAP_BYTES);
+    if (bytes === null) throw new BridgeError("remote_plugin_incomplete");
+    return { path, data: bytes.toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") };
+  });
+  const digest = createHash("sha256").update(files.map((file) => `${file.path}\0${file.sha256}`).join("\n")).digest("hex");
+  cachedBundle = { files, digest };
+  return cachedBundle;
+}
+
+// A self-contained ES module piped to `node --input-type=module -` on the VPS: it writes the plugin
+// copy to a temporary directory, verifies every digest, renames it into place and keeps one older
+// copy. Data travels as a JSON literal, never through the shell.
+function remoteSyncProgram() {
+  const bundle = remoteBundle();
+  const payload = JSON.stringify({ profile, copy: remoteCopyName(), files: bundle.files });
+  return `import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+const bundle = ${payload};
+if (Number(process.versions.node.split(".")[0]) < ${MINIMUM_REMOTE_NODE}) { process.stderr.write("AlgoRover remote: node_too_old\\n"); process.exit(5); }
+const base = join(homedir(), ".algorover-remote", bundle.profile);
+mkdirSync(base, { recursive: true, mode: 0o700 });
+if (lstatSync(base).isSymbolicLink()) { process.stderr.write("AlgoRover remote: remote_path_invalid\\n"); process.exit(6); }
+const target = join(base, bundle.copy);
+const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+const intact = () => bundle.files.every((file) => { try { return lstatSync(join(target, file.path)).isFile() && digest(join(target, file.path)) === file.sha256; } catch { return false; } });
+let synced = false;
+if (!intact()) {
+  const temporary = join(base, ".incoming-" + randomUUID());
+  for (const file of bundle.files) {
+    if (file.path.split("/").some((part) => part === "" || part === "." || part === "..")) { process.stderr.write("AlgoRover remote: remote_path_invalid\\n"); process.exit(6); }
+    const path = join(temporary, ...file.path.split("/"));
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, Buffer.from(file.data, "base64"), { mode: 0o600 });
+    if (digest(path) !== file.sha256) { rmSync(temporary, { recursive: true, force: true }); process.stderr.write("AlgoRover remote: remote_copy_corrupt\\n"); process.exit(7); }
+  }
+  rmSync(target, { recursive: true, force: true });
+  renameSync(temporary, target);
+  synced = true;
+}
+const others = readdirSync(base).filter((name) => name !== bundle.copy && !name.startsWith(".")).map((name) => ({ name, at: statSync(join(base, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+for (const old of others.slice(1)) rmSync(join(base, old.name), { recursive: true, force: true });
+for (const name of readdirSync(base).filter((name) => name.startsWith(".incoming-"))) rmSync(join(base, name), { recursive: true, force: true });
+process.stdout.write(JSON.stringify({ schema: "algorover-remote-sync-v1", synced, copy: bundle.copy }) + "\\n");
+`;
+}
+
+async function syncRemotePlugin(destination, auth = BATCH) {
+  const result = await runSsh(destination, remoteShell("exec \"$N\" --input-type=module -"), { input: remoteSyncProgram(), auth });
+  if (result.code !== null) throw new BridgeError(result.code);
+  return lastJsonLine(result.stdout);
+}
+
+function lastJsonLine(text) {
+  const line = String(text ?? "").trim().split(/\r?\n/u).at(-1);
+  try { return JSON.parse(line); } catch { throw new BridgeError("remote_output_invalid"); }
+}
+
+async function remoteBootstrap(destination, args, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS, auth = BATCH) {
+  const quoted = args.map((value) => {
+    if (!/^[A-Za-z0-9_.:=-]+$/u.test(value)) throw new BridgeError("remote_command_invalid");
+    return value;
+  }).join(" ");
+  const command = remoteShell(`D=${remoteCopyDirectory()}; [ -f "$D/bootstrap.mjs" ] || { echo "AlgoRover remote: remote_plugin_missing" >&2; exit 4; }; exec "$N" "$D/bootstrap.mjs" ${quoted}`);
+  let result = await runSsh(destination, command, { timeoutMs, auth });
+  if (result.code === "remote_plugin_missing") {
+    await syncRemotePlugin(destination, auth);
+    result = await runSsh(destination, command, { timeoutMs, auth });
+  }
+  return result;
+}
+
+async function remoteHostCheck(destination, auth = BATCH) {
+  await syncRemotePlugin(destination, auth);
+  const checked = await remoteBootstrap(destination, ["host-check", "--product", profile, "--network", profile === "live" ? "yes" : "no"], REMOTE_COMMAND_TIMEOUT_MS, auth);
+  if (checked.code !== null) throw new BridgeError(checked.code);
+  return lastJsonLine(checked.stdout);
+}
+
+function compareVersionParts(text, minimum) {
+  const parts = String(text ?? "").replace(/^v/u, "").split(".").map((part) => Number.parseInt(part, 10));
+  for (let index = 0; index < minimum.length; index += 1) {
+    const value = Number.isFinite(parts[index]) ? parts[index] : 0;
+    if (value !== minimum[index]) return value - minimum[index];
+  }
+  return 0;
+}
+
+// --- probing and preparing the VPS ---------------------------------------------------------
+
+// Read-only facts about the VPS, gathered by the login user in one round trip without Node.
+// With root the Runtime runs as REMOTE_SERVICE_USER, so its home, Node and linger are checked.
+// stdin carries one line: the sudo password, which is only tried with `sudo -k true`.
+const PROBE_SCRIPT = [
+  "IFS= read -r P || P=\"\"",
+  "I=$(id -u); U=$(id -un)",
+  `if [ "$I" = 0 ]; then TU=${REMOTE_SERVICE_USER}; else TU="$U"; fi`,
+  // The login session's own home is where sshd reads its keys; the passwd entry only for another user.
+  "if [ \"$TU\" = \"$U\" ]; then TH=\"$HOME\"; else TH=$(getent passwd \"$TU\" 2>/dev/null | cut -d: -f6); fi",
+  "echo os=$(uname -s); echo arch=$(uname -m); echo uid=$I; echo user=$U; echo target_user=$TU",
+  "if [ -n \"$TH\" ]; then echo target_exists=yes; else echo target_exists=no; fi",
+  "echo glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d\" \" -f2)",
+  "V=\"\"; for c in \"$TH\"/.algorover-remote/node/bin/node \"$(command -v node 2>/dev/null)\" /usr/local/bin/node /usr/bin/node; do if [ -z \"$V\" ] && [ -n \"$c\" ] && [ -x \"$c\" ]; then V=$(\"$c\" -v 2>/dev/null); fi; done; echo node=$V",
+  "if [ \"$(ps -o comm= -p 1 2>/dev/null)\" = systemd ]; then echo systemd=yes; else echo systemd=no; fi",
+  "echo linger=$(loginctl show-user \"$TU\" -p Linger --value 2>/dev/null)",
+  "echo ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)",
+  "echo disk_kb=$(df -Pk \"${TH:-$HOME}\" 2>/dev/null | tail -n 1 | tr -s \" \" | cut -d\" \" -f4)",
+  "echo memory_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | tr -s \" \" | cut -d\" \" -f2)",
+  "if [ \"$I\" = 0 ]; then S=root; elif sudo -n true >/dev/null 2>&1; then S=nopasswd; elif id -nG 2>/dev/null | tr \" \" \"\\n\" | grep -qx -e sudo -e wheel -e admin; then S=password; else S=none; fi; echo sudo=$S",
+  "if [ \"$S\" = password ] && [ -n \"$P\" ]; then if printf \"%s\\n\" \"$P\" | sudo -S -k -p \"\" true >/dev/null 2>&1; then echo sudo_password=ok; else echo sudo_password=rejected; fi; fi",
+  `if [ -n "$TH" ] && [ -f "$TH/.algorover-runtime-${profile}-production/runtime/current.json" ]; then echo installed=yes; else echo installed=no; fi`,
+].join("; ");
+
+async function probeVps(destination, auth, sudoPassword) {
+  const result = await runSsh(destination, remoteShell(PROBE_SCRIPT, { node: false }), { input: `${sudoPassword ?? ""}\n`, hostKeys: "accept-new", auth, timeoutMs: 60_000 });
+  if (result.code !== null) throw new BridgeError(result.code);
+  const facts = {};
+  for (const line of result.stdout.split(/\r?\n/u)) {
+    const match = /^([a-z_]+)=(.*)$/u.exec(line.trim());
+    if (match) facts[match[1]] = match[2].trim();
+  }
+  if (!facts.uid || !facts.user) throw new BridgeError("remote_output_invalid");
+  return facts;
+}
+
+const STEP_TEXT = {
+  create_user: `create the user "${REMOTE_SERVICE_USER}" to run AlgoRover (it does not run as root)`,
+  enable_linger: "keep AlgoRover's services running after logout and start them at boot (linger)",
+  sync_time: "turn on clock synchronization",
+  install_key: "install AlgoRover's own SSH key, so later connections need no password",
+  install_node: `install Node.js ${REMOTE_NODE.version} for AlgoRover only (in its home folder)`,
+  install_runtime: "install and start the AlgoRover Runtime",
+  connect_runtime: "connect to the AlgoRover Runtime already installed there",
+  remote_platform_unsupported: "the VPS must be Linux on x86_64; arm64 and other systems are not supported",
+  remote_glibc_too_old: "the VPS system is too old: it needs glibc 2.35 or newer (Ubuntu 22.04 or 24.04, Debian 12)",
+  remote_runtime_unavailable: "this plugin version has no Linux Runtime",
+  remote_disk_full: "less than 3 GB of disk space is free on the VPS",
+  remote_services_unmanaged: "the VPS has no systemd, so AlgoRover does not restart on its own after a reboot or crash",
+  remote_linger_unavailable: "AlgoRover cannot be kept running after logout (no sudo rights to turn on linger)",
+  remote_clock_unsynchronized: "the VPS clock is not synchronized and there are no rights to turn it on (Binance rejects skewed requests)",
+  remote_disk_low: "less than 5 GB of disk space is free",
+  remote_memory_low: "less than 1.5 GB of memory is available",
+  remote_dashboard_port_exposed: "a Dashboard port listens on a public address; the page has no sign-in, close it in the firewall",
+  user_create_failed: "the user could not be created on the VPS",
+  linger_failed: "linger could not be turned on",
+  key_install_failed: "the SSH key could not be installed",
+  key_login_refused: "the VPS does not accept AlgoRover's SSH key (the server may disable key login: PubkeyAuthentication in /etc/ssh/sshd_config)",
+  node_download_failed: "Node.js could not be downloaded on the VPS (no internet access, or neither curl nor wget is installed)",
+  node_checksum_mismatch: "the downloaded Node.js did not match its checksum",
+  node_install_failed: "Node.js could not be unpacked on the VPS",
+};
+
+function checkText(code) {
+  if (code.startsWith("remote_venue_restricted:")) return `${code.split(":")[1]} refuses this VPS region`;
+  if (code.startsWith("remote_venue_unreachable:")) return `${code.split(":")[1]} cannot be reached from this VPS`;
+  return STEP_TEXT[code] ?? code;
+}
+
+// What deploy_to_vps would do: blocking problems end it, needs are asked from the user, steps are
+// what it will do on the VPS, warnings are shown in the plan.
+function evaluateVps(facts, { keyLogin, sudoPassword, allowNotDurable, report }) {
+  const blocking = [], needs = [], steps = [], warnings = [];
+  const root = facts.uid === "0";
+  if (facts.os !== "Linux" || !["x86_64", "amd64"].includes(facts.arch)) blocking.push("remote_platform_unsupported");
+  else if (!facts.glibc || compareVersionParts(facts.glibc, MINIMUM_REMOTE_GLIBC) < 0) blocking.push("remote_glibc_too_old");
+  if (!delivery.runtime_bindings.some((binding) => binding.os === "linux" && binding.arch === "amd64")) blocking.push("remote_runtime_unavailable");
+  const disk = Number(facts.disk_kb) * 1024;
+  if (Number.isFinite(disk) && disk > 0 && disk < MINIMUM_REMOTE_DISK_BYTES) blocking.push("remote_disk_full");
+  const privileged = root || facts.sudo === "nopasswd" || facts.sudo_password === "ok";
+  if (root && facts.target_exists !== "yes") steps.push("create_user");
+  // linger belongs to systemd-logind: without systemd there is nothing to turn on (see the warning below).
+  if (facts.linger !== "yes" && facts.systemd === "yes") {
+    if (privileged) steps.push("enable_linger");
+    else if (facts.sudo === "password" && !allowNotDurable) needs.push(facts.sudo_password === "rejected" || sudoPassword ? "sudo_password_rejected" : "sudo_password");
+    else warnings.push("remote_linger_unavailable");
+  }
+  if (facts.ntp === "no") {
+    if (privileged) steps.push("sync_time");
+    else warnings.push("remote_clock_unsynchronized");
+  }
+  if (!keyLogin) steps.push("install_key");
+  if (!facts.node || compareVersionParts(facts.node, [MINIMUM_REMOTE_NODE]) < 0) steps.push("install_node");
+  steps.push(facts.installed === "yes" ? "connect_runtime" : "install_runtime");
+  if (facts.systemd !== "yes") warnings.push("remote_services_unmanaged");
+  if (Number.isFinite(disk) && disk > 0 && disk < 5 * 1024 ** 3 && !blocking.includes("remote_disk_full")) warnings.push("remote_disk_low");
+  const memory = Number(facts.memory_kb) * 1024;
+  if (Number.isFinite(memory) && memory > 0 && memory < 1536 * 1024 ** 2) warnings.push("remote_memory_low");
+  if (Array.isArray(report?.exposed_ports) && report.exposed_ports.length > 0) warnings.push("remote_dashboard_port_exposed");
+  const venues = [];
+  for (const venue of Array.isArray(report?.venues) ? report.venues : []) {
+    if (typeof venue?.venue !== "string") continue;
+    venues.push({ venue: venue.venue, reachable: venue.result === "reachable" });
+    if (venue.result !== "reachable") warnings.push(`remote_venue_${venue.result === "restricted" ? "restricted" : "unreachable"}:${venue.venue}`);
+  }
+  // Without linger or systemd the services stop when SSH logs out or the VPS reboots: no live trading.
+  const durable = facts.systemd === "yes" && (facts.linger === "yes" || steps.includes("enable_linger"));
+  return { blocking, needs, steps, warnings, venues: report ? venues : null, suitable_for_live: blocking.length === 0 && durable };
+}
+
+// The preparation that needs the login user's rights, in one connection: the service user,
+// linger, clock synchronization and this product's key. stdin: sudo password, public key.
+function setupScript(steps) {
+  const parts = [
+    "IFS= read -r P || P=\"\"; IFS= read -r K",
+    "fail() { echo \"AlgoRover remote: $1\" >&2; exit 9; }",
+    "R() { if [ \"$(id -u)\" = 0 ]; then \"$@\"; elif [ -n \"$P\" ]; then printf \"%s\\n\" \"$P\" | sudo -S -p \"\" \"$@\"; else sudo -n \"$@\"; fi; }",
+    `if [ "$(id -u)" = 0 ]; then TU=${REMOTE_SERVICE_USER}; else TU=$(id -un); fi`,
+  ];
+  if (steps.includes("create_user")) parts.push(`id "$TU" >/dev/null 2>&1 || useradd -m -s /bin/bash "$TU" >/dev/null 2>&1 || fail user_create_failed`);
+  parts.push("if [ \"$TU\" = \"$(id -un)\" ]; then TH=\"$HOME\"; else TH=$(getent passwd \"$TU\" 2>/dev/null | cut -d: -f6); fi",
+    "[ -n \"$TH\" ] && [ -d \"$TH\" ] || fail key_install_failed");
+  if (steps.includes("enable_linger")) parts.push("R loginctl enable-linger \"$TU\" >/dev/null 2>&1 || fail linger_failed");
+  if (steps.includes("sync_time")) parts.push("R timedatectl set-ntp true >/dev/null 2>&1 || true");
+  if (steps.includes("install_key")) {
+    parts.push("mkdir -p \"$TH/.ssh\" && touch \"$TH/.ssh/authorized_keys\" || fail key_install_failed",
+      "grep -qxF \"$K\" \"$TH/.ssh/authorized_keys\" || printf \"%s\\n\" \"$K\" >> \"$TH/.ssh/authorized_keys\" || fail key_install_failed",
+      "chmod go-w \"$TH\"; chmod 700 \"$TH/.ssh\"; chmod 600 \"$TH/.ssh/authorized_keys\"",
+      "if [ \"$(id -u)\" = 0 ]; then chown -R \"$TU\": \"$TH/.ssh\" || fail key_install_failed; fi");
+  }
+  parts.push("echo setup=ok");
+  return parts.join("; ");
+}
+
+// Node.js for AlgoRover only, verified by digest and swapped into place. stdin: two download
+// addresses (this product's release storage first, then nodejs.org) and the digest.
+const NODE_INSTALL_SCRIPT = [
+  "IFS= read -r A; IFS= read -r B; IFS= read -r H",
+  "fail() { echo \"AlgoRover remote: $1\" >&2; exit 9; }",
+  "D=\"$HOME/.algorover-remote/node\"; T=\"$D.incoming\"; rm -rf \"$T\"; mkdir -p \"$T\" || fail node_install_failed",
+  "get() { if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 2 --connect-timeout 20 -o \"$T/node.tar.gz\" \"$1\"; elif command -v wget >/dev/null 2>&1; then wget -q -T 20 -O \"$T/node.tar.gz\" \"$1\"; else return 1; fi; }",
+  "ok=no; bad=no; for u in \"$A\" \"$B\"; do if [ $ok = no ] && [ -n \"$u\" ] && get \"$u\"; then if echo \"$H  $T/node.tar.gz\" | sha256sum -c - >/dev/null 2>&1; then ok=yes; else bad=yes; fi; fi; done",
+  "if [ $ok = no ]; then rm -rf \"$T\"; if [ $bad = yes ]; then fail node_checksum_mismatch; else fail node_download_failed; fi; fi",
+  "tar -xzf \"$T/node.tar.gz\" -C \"$T\" --strip-components=1 && rm -f \"$T/node.tar.gz\" && \"$T/bin/node\" -v >/dev/null 2>&1 || { rm -rf \"$T\"; fail node_install_failed; }",
+  "rm -rf \"$D\" && mv \"$T\" \"$D\" || fail node_install_failed",
+  "echo node=$(\"$D/bin/node\" -v)",
+].join("; ");
+
+function nodeSources() {
+  // Release storage: the directory above <product>/channels/ of this plugin's channel.
+  const storage = /^(https:\/\/[^\s'"]+)\/(?:live|research)\/channels\/[^/]+$/u.exec(delivery.channel_url ?? "")?.[1];
+  return { urls: [...(storage ? [`${storage}/node/${REMOTE_NODE.file}`] : []), `https://nodejs.org/dist/v${REMOTE_NODE.version}/${REMOTE_NODE.file}`], sha256: REMOTE_NODE.sha256 };
+}
+
+// --- deploy_to_vps -------------------------------------------------------------------------
+
+function canonicalDigest(value) {
+  const canonical = (item) => Array.isArray(item) ? `[${item.map(canonical).join(",")}]`
+    : isPlainObject(item) ? `{${Object.keys(item).sort().map((key) => `${JSON.stringify(key)}:${canonical(item[key])}`).join(",")}}` : JSON.stringify(item ?? null);
+  return `sha256:${createHash("sha256").update(canonical(value)).digest("hex")}`;
+}
+
+function bootstrapLifecycleArguments(command, extra = []) {
+  const args = [validateBootstrapFile(configuredBootstrapPath()), command, "--runtime-home", runtimeHome, "--product", profile, "--environment", delivery.environment];
+  if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
+  if (process.env.ALGOROVER_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.ALGOROVER_LIVE_STATE_ROOT);
+  if (process.env.ALGOROVER_RESEARCH_STATE_ROOT) args.push("--research-state-root", process.env.ALGOROVER_RESEARCH_STATE_ROOT);
+  return [...args, ...extra];
+}
+
+async function localDisable(checkOnly) {
+  if (readInstalledRuntimeId() === null && !existsSync(join(runtimeHome, "runtime", "services.json"))) return { state: "not_installed" };
+  const completed = await runLifecycleProcess(bootstrapLifecycleArguments("disable", ["--check-only", checkOnly ? "yes" : "no"]));
+  if (completed.status !== 0) return { state: "refused", code: /^AlgoRover bootstrap: ([a-z0-9_]+)$/mu.exec(completed.stderr ?? "")?.[1] ?? "bootstrap_failed" };
+  return { state: checkOnly ? "allowed" : "disabled" };
+}
+
+async function remoteDisable(destination, checkOnly) {
+  const result = await remoteBootstrap(destination, ["disable", "--product", profile, "--check-only", checkOnly ? "yes" : "no"], 300_000);
+  if (result.code === null) return { state: checkOnly ? "allowed" : "disabled" };
+  if (["trading_work_open", "runtime_in_use", "legacy_trading_state_present", "host_stop_failed", "trading_service_drain_timeout"].includes(result.code)) return { state: "refused", code: result.code };
+  if (result.code.startsWith("ssh_")) return { state: "unreachable", code: result.code };
+  return { state: "refused", code: result.code };
+}
+
+const REFUSAL_TEXT = {
+  trading_work_open: "strategies still run, hold positions or have open orders; stop them (and close positions) first",
+  runtime_in_use: "a background task (backtest or data download) still runs; wait for it or cancel it first",
+  legacy_trading_state_present: "old v1 trading tasks are still being handed over; update once first",
+};
+
+function deployArguments(value) {
+  const allowed = new Set(["action", "host", "port", "user", "password", "sudo_password", "key_file", "allow_not_durable", "reset_host_key", "confirmation"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new BridgeError("invalid_arguments");
+  for (const key of ["password", "sudo_password"]) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || value[key].length === 0 || value[key].length > 512 || /[\r\n\0]/u.test(value[key]))) throw new BridgeError("invalid_arguments");
+  }
+  for (const key of ["allow_not_durable", "reset_host_key"]) if (value[key] !== undefined && typeof value[key] !== "boolean") throw new BridgeError("invalid_arguments");
+  if (value.confirmation !== undefined && (typeof value.confirmation !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(value.confirmation))) throw new BridgeError("invalid_arguments");
+  const port = value.port === undefined ? 22 : typeof value.port === "string" && /^\d{1,5}$/u.test(value.port) ? Number(value.port) : value.port;
+  const destination = validDestination({ host: value.host, port, user: value.user });
+  if (destination === null) throw new BridgeError("invalid_destination");
+  let keyFile = null;
+  if (value.key_file !== undefined) {
+    if (typeof value.key_file !== "string" || value.key_file.length > 1024 || /[\r\n\0]/u.test(value.key_file)) throw new BridgeError("invalid_arguments");
+    const path = value.key_file.startsWith("~") ? join(homedir(), value.key_file.slice(1)) : value.key_file;
+    if (!isAbsolute(path)) throw new BridgeError("key_file_not_found");
+    let metadata;
+    try { metadata = lstatSync(path); } catch { throw new BridgeError("key_file_not_found"); }
+    if (!metadata.isFile() || metadata.size > 64 * 1024) throw new BridgeError("key_file_not_found");
+    keyFile = path;
+  }
+  return { destination, password: value.password ?? null, sudoPassword: value.sudo_password ?? value.password ?? null, keyFile,
+    allowNotDurable: value.allow_not_durable === true, resetHostKey: value.reset_host_key === true, confirmation: value.confirmation };
+}
+
+function needsResult(needs, context, text) {
+  return targetResult({ state: "needs_input", needs, destination: destinationLabel(context.destination), required_action: "ask_user" }, false, text);
+}
+
+// Logs in with the first method that works: this product's own key (installed by an earlier
+// deploy), the user's own SSH keys, then the given key file or password.
+async function vpsLogin(input) {
+  const target = { ...input.destination, user: input.destination.user === "root" ? REMOTE_SERVICE_USER : input.destination.user };
+  const probeWith = async (destination, auth, keyLogin) => {
+    const result = await runSsh(destination, "exit 0", { hostKeys: "accept-new", auth, timeoutMs: 60_000 });
+    return result.code === null ? { destination, auth, keyLogin } : { failure: result.code };
+  };
+  // With root, log in as root even when the service user already has the key: only root can
+  // still create the user or turn on linger (installing the key again changes nothing).
+  if (target.user === input.destination.user && existsSync(remoteKeyPath)) {
+    const own = await probeWith(target, { mode: "key_file", path: remoteKeyPath }, true);
+    if (!own.failure) return own;
+    if (own.failure !== "ssh_auth_failed") return { failure: own.failure };
+  }
+  const users = await probeWith(input.destination, BATCH, false);
+  if (!users.failure) return users;
+  if (users.failure !== "ssh_auth_failed") return { failure: users.failure };
+  if (input.keyFile !== null) {
+    const keyed = await probeWith(input.destination, { mode: "key_file", path: input.keyFile }, false);
+    if (!keyed.failure) return keyed;
+    if (keyed.failure !== "ssh_auth_failed") return { failure: keyed.failure };
+    return { failure: "key_file_rejected" };
+  }
+  if (input.password !== null) {
+    const label = destinationLabel(input.destination);
+    if ((passwordFailures.get(label) ?? 0) >= MAXIMUM_PASSWORD_FAILURES) return { failure: "password_attempts_exhausted" };
+    const passworded = await probeWith(input.destination, { mode: "password", password: input.password }, false);
+    if (!passworded.failure) { passwordFailures.delete(label); return passworded; }
+    if (passworded.failure !== "ssh_auth_failed") return { failure: passworded.failure };
+    passwordFailures.set(label, (passwordFailures.get(label) ?? 0) + 1);
+    return { failure: (passwordFailures.get(label) ?? 0) >= MAXIMUM_PASSWORD_FAILURES ? "password_attempts_exhausted" : "password_rejected" };
+  }
+  return { failure: "password_required" };
+}
+
+const LOGIN_NEEDS = {
+  password_required: "Ask the user for the VPS password (or the path of the private key file the VPS provider gave them), then call deploy_to_vps again with all arguments.",
+  password_rejected: "The VPS rejected the password. Ask the user to check the user name and password, then call deploy_to_vps again. After one more wrong password this conversation stops trying, because servers often block an address after failed logins.",
+  password_attempts_exhausted: "Two passwords were rejected, so no more are tried in this conversation (servers often block an address after failed logins). Ask the user to check the password, for example by logging in at the VPS provider's web console, then start a new conversation.",
+  key_file_rejected: "The VPS rejected that key file. Ask the user to check the file and the user name (for example ubuntu or ec2-user on cloud servers), or give the password instead.",
+};
+
+async function deployToVps(argumentsValue) {
+  const input = deployArguments(argumentsValue);
+  if (input.keyFile === null) return deployWith(input, argumentsValue);
+  // ssh refuses a private key others can read, as downloaded .pem files often are: use a private copy.
+  mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+  const copy = join(remoteRoot, `imported-key-${randomUUID()}`);
+  try {
+    writeFileSync(copy, readFileSync(input.keyFile), { mode: 0o600 });
+    return await deployWith({ ...input, keyFile: copy }, argumentsValue);
+  } finally {
+    rmSync(copy, { force: true });
+  }
+}
+
+async function deployWith(input, argumentsValue) {
+  const context = { destination: input.destination };
+  if (remoteTarget !== null) {
+    const current = remoteTarget.destination;
+    const same = current.host === input.destination.host && current.port === input.destination.port
+      && [input.destination.user, REMOTE_SERVICE_USER].includes(current.user);
+    if (same) return targetStatus("AlgoRover already runs on this VPS.");
+    return targetResult({ state: "refused", message: "remote_target_active", required_action: "switch_to_local_first" }, true,
+      `AlgoRover ${PRODUCT_NAME} already runs on ${destinationLabel(current)}. Switch back to this computer first (switch_to_local), then deploy to the other VPS: one VPS per product.`);
+  }
+  if (input.resetHostKey) rmSync(remoteKnownHosts, { force: true });
+  const publicKey = await pluginPublicKey();
+  const login = await vpsLogin(input);
+  if (login.failure) {
+    if (LOGIN_NEEDS[login.failure]) return needsResult([login.failure], context, LOGIN_NEEDS[login.failure]);
+    if (login.failure === "ssh_host_key_changed") return needsResult(["confirm_server_replaced"], context, guidance(login.failure));
+    return targetResult({ state: "error", message: login.failure, destination: destinationLabel(input.destination), required_action: "fix_connection" }, true,
+      `Cannot log in to ${destinationLabel(input.destination)} (${login.failure}). ${guidance(login.failure)}`);
+  }
+  const facts = await probeVps(login.destination, login.auth, input.sudoPassword);
+  const target = { host: input.destination.host, port: input.destination.port, user: facts.target_user };
+  if (!validDestination(target)) throw new BridgeError("remote_output_invalid");
+  // Exchange reachability needs Node on the VPS: checked now when it is there, otherwise after installing it.
+  let report = null;
+  if (facts.user === facts.target_user && facts.node && compareVersionParts(facts.node, [MINIMUM_REMOTE_NODE]) >= 0) {
+    try { report = await remoteHostCheck(login.destination, login.auth); } catch { report = null; }
+  }
+  const evaluation = evaluateVps(facts, { keyLogin: login.keyLogin, sudoPassword: argumentsValue.sudo_password, allowNotDurable: input.allowNotDurable, report });
+  const fingerprints = await hostKeyFingerprints(remoteKnownHosts);
+  if (evaluation.blocking.length) {
+    return targetResult({ state: "unsuitable", destination: destinationLabel(target), check: evaluation, required_action: "fix_remote_host" }, true,
+      `${destinationLabel(input.destination)} cannot run AlgoRover: ${evaluation.blocking.map(checkText).join("; ")}. Nothing was changed.`);
+  }
+  if (evaluation.needs.length) {
+    const rejected = evaluation.needs.includes("sudo_password_rejected");
+    return needsResult(evaluation.needs, context, `${rejected ? "The sudo password was rejected." : `The user "${facts.user}" needs a sudo password to keep AlgoRover running after logout (linger).`} Ask the user for the sudo password (often the login password) and call deploy_to_vps again with sudo_password; or, if they do not have it, call again with allow_not_durable=true: AlgoRover then stops when nobody is logged in, so it is not suitable for 7x24 live trading.`);
+  }
+  const local = await localDisable(true);
+  const migration = profile === "live" ? migrationInventory() : { accounts: 0, items: 0, bytes: 0, too_large: false, list: [] };
+  const summary = { action: "deploy_to_vps", profile, destination: target, login_user: facts.user, steps: evaluation.steps,
+    warnings: evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")), suitable_for_live: evaluation.suitable_for_live, local,
+    migration: { items: migration.items, bytes: migration.bytes, too_large: migration.too_large } };
+  const plan = { ...summary, destination: destinationLabel(target), host_key_fingerprints: fingerprints, venues: evaluation.venues, warnings: evaluation.warnings };
+  if (local.state === "refused") return targetResult({ state: "refused", message: local.code, plan }, true,
+    `Cannot move AlgoRover to the VPS yet: on this computer ${REFUSAL_TEXT[local.code] ?? local.code}.`);
+  if (migration.too_large) return targetResult({ state: "refused", message: "migration_too_large", plan }, true,
+    "The strategies to copy from this computer exceed 64 MB; nothing was changed.");
+  const digest = canonicalDigest(summary);
+  if (input.confirmation !== digest) {
+    const newConversation = local.state !== "not_installed";
+    return targetResult({ state: "awaiting_confirmation", plan, confirmation: digest, required_action: "confirm_deploy" }, false, [
+      input.confirmation === undefined ? "" : "The situation changed since the last plan; show this new one.",
+      `Ask the user to approve this plan for ${destinationLabel(target)}${facts.user === target.user ? "" : ` (logged in as ${facts.user})`}:`,
+      evaluation.steps.map((step, index) => `${index + 1}) ${checkText(step)};`).join(" "),
+      profile === "live" && migration.items > 0 ? `then ${migration.items} items from this computer (custom strategies, strategy configurations and installed strategy packages, ${(migration.bytes / 1024 ** 2).toFixed(1)} MB) are copied to the VPS, keeping what is already there; backtest results stay here;` : "",
+      local.state === "not_installed" ? "" : "this computer's Runtime services stop and no longer start automatically; its install and data stay, so switching back is possible;",
+      "on the VPS the user signs in again, enters exchange API keys again (without withdrawal permission) and redeploys strategies.",
+      fingerprints.length ? `VPS host key ${fingerprints[0].split(" ")[0]} is remembered; a different one later is refused.` : "",
+      evaluation.venues ? `Exchanges reachable from the VPS: ${evaluation.venues.filter((venue) => venue.reachable).map((venue) => venue.venue).join(", ") || "none"}${evaluation.venues.some((venue) => !venue.reachable) ? `; not reachable: ${evaluation.venues.filter((venue) => !venue.reachable).map((venue) => venue.venue).join(", ")}` : ""}.` : (profile === "live" ? "Exchange reachability is checked after Node.js is installed." : ""),
+      evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")).length ? `Warnings: ${evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")).map(checkText).join("; ")}.` : "",
+      evaluation.suitable_for_live ? "The VPS is suitable for 7x24 trading." : "This VPS is NOT suitable for 7x24 live trading: AlgoRover stops when nobody is logged in or after a reboot.",
+      newConversation ? "Afterwards the user continues in a new conversation." : "",
+      "Only after the user agrees, call deploy_to_vps again with the same arguments plus this confirmation.",
+    ].filter(Boolean).join(" "));
+  }
+  return executeDeploy({ input, login, facts, target, evaluation, local, migration, publicKey, plan });
+}
+
+async function executeDeploy({ input, login, facts, target, evaluation, local, migration, publicKey, plan }) {
+  const done = [];
+  const failed = (step, code, extra = {}) => targetResult({ state: "error", message: code, failed_step: step, completed_steps: done, plan, required_action: "retry_deploy", ...extra }, true,
+    `Step "${checkText(step)}" failed (${code}): ${guidance(code)} Completed: ${done.length ? done.map(checkText).join("; ") : "nothing"}. Nothing on this computer was changed. Calling deploy_to_vps again continues from the failed step.`);
+  const privileged = evaluation.steps.filter((step) => ["create_user", "enable_linger", "sync_time", "install_key"].includes(step));
+  if (privileged.length) {
+    const setup = await runSsh(login.destination, remoteShell(setupScript(privileged), { node: false }), { input: `${input.sudoPassword ?? ""}\n${publicKey}\n`, hostKeys: "accept-new", auth: login.auth, timeoutMs: 120_000 });
+    if (setup.code !== null) return failed(privileged[0], setup.code);
+    done.push(...privileged);
+  }
+  // From here on this product's own key logs in as the user AlgoRover runs as.
+  const own = await runSsh(target, "exit 0", { auth: { mode: "key_file", path: remoteKeyPath }, timeoutMs: 60_000 });
+  if (own.code !== null) return failed("install_key", own.code === "ssh_auth_failed" ? "key_login_refused" : own.code);
+  if (evaluation.steps.includes("install_node")) {
+    const sources = nodeSources();
+    const installed = await runSsh(target, remoteShell(NODE_INSTALL_SCRIPT, { node: false }), { input: `${sources.urls[0] ?? ""}\n${sources.urls[1] ?? ""}\n${sources.sha256}\n`, timeoutMs: 600_000 });
+    if (installed.code !== null) return failed("install_node", installed.code);
+    done.push("install_node");
+  }
+  let report;
+  try { report = await remoteHostCheck(target); } catch (error) { return failed("install_runtime", error instanceof BridgeError ? error.code : "remote_check_failed"); }
+  if (report?.platform?.os !== "linux" || report.platform.arch !== "amd64" || compareVersionParts(report.platform.glibc, MINIMUM_REMOTE_GLIBC) < 0) return failed("install_runtime", "remote_platform_unsupported");
+  const venues = Array.isArray(report?.venues) ? report.venues.filter((venue) => typeof venue?.venue === "string").map((venue) => ({ venue: venue.venue, reachable: venue.result === "reachable" })) : null;
+  const channel = new RemoteChannel(target);
+  let started;
+  try {
+    await channel.open();
+    const response = await channel.request("tools/call", { name: "algorover_runtime_start", arguments: {} }, REMOTE_CALL_TIMEOUT_MS);
+    started = response?.result?.structuredContent ?? null;
+  } catch (error) {
+    channel.close();
+    return failed("install_runtime", error instanceof BridgeError ? error.code : "remote_start_failed");
+  }
+  if (started?.state !== "ready") {
+    channel.close();
+    return failed("install_runtime", started?.message ?? `remote_runtime_${started?.state ?? "unknown"}`, { remote_status: started });
+  }
+  done.push(evaluation.steps.includes("connect_runtime") ? "connect_runtime" : "install_runtime");
+  let copied = null;
+  if (profile === "live") {
+    try { copied = await migrateToRemote(target, migration); } catch (error) {
+      channel.close();
+      return failed("install_runtime", error instanceof BridgeError ? error.code : "migration_failed");
+    }
+  }
+  if (local.state !== "not_installed") {
+    const disabled = await localDisable(false);
+    if (disabled.state === "refused") {
+      channel.close();
+      return targetResult({ state: "refused", message: disabled.code, completed_steps: done, plan }, true,
+        `The VPS is ready, but this computer's Runtime could not stop: ${REFUSAL_TEXT[disabled.code] ?? disabled.code}. Nothing was switched; calling deploy_to_vps again finishes the move.`);
+    }
+  }
+  const check = { suitable_for_live: evaluation.suitable_for_live, warnings: evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")) };
+  writePrivateJson(remoteTargetPath, { schema: REMOTE_TARGET_SCHEMA, profile, destination: target, activated_at: new Date().toISOString(), check });
+  remoteTarget = readRemoteTarget();
+  remoteChannel?.close();
+  remoteChannel = channel;
+  remoteAdmittedRuntimeId = typeof started.runtime_id === "string" ? started.runtime_id : null;
+  remoteStale = false;
+  // A first installation had nothing on this computer the conversation could have used.
+  placementSwitched = local.state !== "not_installed";
+  const tunnel = await ensureTunnel(REMOTE_DASHBOARD_PORTS[0]);
+  announceListChanged();
+  const dashboard = `http://127.0.0.1:${REMOTE_DASHBOARD_PORTS[0]}/`;
+  return targetResult({ state: "deployed", placement: "remote", destination: destinationLabel(target), completed_steps: done, migration: copied, tunnel, venues,
+    suitable_for_live: evaluation.suitable_for_live, dashboard_url: dashboard, required_action: placementSwitched ? "new_conversation" : "continue" }, false, [
+    `AlgoRover ${PRODUCT_NAME} now runs on the VPS ${destinationLabel(target)}.`,
+    copied && copied.copied + copied.skipped > 0 ? `Copied ${copied.copied} items from this computer, kept ${copied.skipped} already on the VPS.` : "",
+    local.state === "not_installed" ? "" : "This computer's Runtime is stopped and kept, so switching back is possible.",
+    venues ? `Exchanges reachable from the VPS: ${venues.filter((venue) => venue.reachable).map((venue) => venue.venue).join(", ") || "none"}.` : "",
+    `Dashboard: ${dashboard} (through an SSH tunnel${tunnel === "ok" ? "" : `; tunnel not ready: ${tunnel}`}). There the user signs in, enters exchange API keys (bind them to the VPS's public IP, without withdrawal permission) and deploys strategies.`,
+    placementSwitched ? "Tell the user to start a new conversation." : "Continue in this conversation.",
+  ].filter(Boolean).join(" "));
+}
+
+async function remoteSwitchToLocal(argumentsValue) {
+  const allowed = new Set(["action", "confirmation", "force"]);
+  if (Object.keys(argumentsValue).some((key) => !allowed.has(key)) || (argumentsValue.force !== undefined && typeof argumentsValue.force !== "boolean"))
+    throw new BridgeError("invalid_arguments");
+  if (remoteTarget === null) return targetStatus("This product already runs on this computer.");
+  const destination = remoteTarget.destination;
+  const remote = await remoteDisable(destination, true);
+  const summary = { action: "switch_to_local", profile, destination, remote, force: argumentsValue.force === true };
+  if (remote.state === "refused") return targetResult({ state: "refused", message: remote.code, summary }, true,
+    `Cannot switch back yet: on the VPS ${REFUSAL_TEXT[remote.code] ?? remote.code}.`);
+  if (remote.state === "unreachable" && argumentsValue.force !== true) return targetResult({ state: "awaiting_confirmation", summary, required_action: "confirm_force_switch" }, true,
+    `The VPS cannot be reached (${remote.code}), so nobody can confirm whether strategies still run there. Warn the user that they may keep trading on the VPS and should log in to the VPS (or the exchange) to check. Only if the user still wants to switch back, call switch_to_local with force=true.`);
+  const digest = canonicalDigest(summary);
+  if (argumentsValue.confirmation !== digest) {
+    return targetResult({ state: "awaiting_confirmation", summary, confirmation: digest, required_action: "confirm_switch" }, false, [
+      `Ask the user to approve moving AlgoRover ${PRODUCT_NAME} back to this computer:`,
+      remote.state === "unreachable" ? "the VPS is unreachable and is NOT stopped;" : "the VPS Runtime services stop and no longer start automatically; its install and data stay on the VPS;",
+      "this computer's Runtime starts on the next use (it is installed first if needed) with its earlier data; strategies deployed on the VPS must be redeployed here; then the user starts a new conversation.",
+      "Only after the user agrees, call switch_to_local again with this confirmation.",
+    ].join(" "));
+  }
+  if (remote.state !== "unreachable") {
+    const disabled = await remoteDisable(destination, false);
+    if (disabled.state !== "disabled") return targetResult({ state: "refused", message: disabled.code, summary }, true,
+      `The VPS Runtime could not stop (${disabled.code}): ${REFUSAL_TEXT[disabled.code] ?? "nothing was switched"}.`);
+  }
+  stopTunnels();
+  rmSync(remoteTargetPath, { force: true });
+  remoteTarget = null;
+  remoteChannel?.close();
+  remoteChannel = null;
+  placementSwitched = true;
+  announceListChanged();
+  return targetResult({ state: "switched", placement: "local", destination: destinationLabel(destination), required_action: "new_conversation" }, false,
+    `AlgoRover ${PRODUCT_NAME} runs on this computer again${remote.state === "unreachable" ? " (the unreachable VPS was not stopped)" : ""}. Tell the user to start a new conversation; the Runtime here starts (or installs) on first use.`);
+}
+
+async function targetStatus(prefix = "") {
+  let reachable = null, error = null;
+  if (remoteTarget !== null) {
+    try { await openRemote(); reachable = true; } catch (failure) { reachable = false; error = failure instanceof BridgeError ? failure.code : "remote_unreachable"; }
+  }
+  const destination = remoteTarget?.destination ?? null;
+  const value = { state: "status", placement: remoteTarget === null ? "local" : "remote", destination: destinationLabel(destination),
+    check: remoteTarget?.check ?? null, remote_reachable: reachable, message: error,
+    tunnels: remoteTarget === null ? [] : readTunnels().map(({ port }) => port), conversation: placementSwitched ? "stale" : "current",
+    local_runtime_installed: readInstalledRuntimeId() !== null };
+  const where = remoteTarget === null ? "this computer" : `the VPS ${destinationLabel(destination)}${reachable ? "" : ` (unreachable: ${error}; ${guidance(error)})`}`;
+  return targetResult(value, false, `${prefix ? `${prefix} ` : ""}AlgoRover ${PRODUCT_NAME} runs on ${where}.${placementSwitched ? " This conversation was opened before a switch: start a new one." : ""}`);
+}
+
+function targetResult(value, isError, text) {
+  return { content: [{ type: "text", text }], structuredContent: { schema: REMOTE_RESULT_SCHEMA, profile, ...value }, ...(isError ? { isError: true } : {}) };
+}
+
+async function executeRuntimeTarget(argumentsValue) {
+  const action = argumentsValue.action;
+  if (action === "status") { if (Object.keys(argumentsValue).length !== 1) throw new BridgeError("invalid_arguments"); return targetStatus(); }
+  if (!["deploy_to_vps", "switch_to_local"].includes(action)) throw new BridgeError("invalid_arguments");
+  if (delivery.environment !== "production" && action !== "switch_to_local")
+    return targetResult({ state: "refused", message: "remote_requires_production" }, true, "Running on a VPS is only available for the production plugin.");
+  try {
+    if (action === "deploy_to_vps") return await deployToVps(argumentsValue);
+    return await remoteSwitchToLocal(argumentsValue);
+  } catch (error) {
+    if (!(error instanceof BridgeError) || ["invalid_arguments", "invalid_destination"].includes(error.code)) throw error;
+    return targetResult({ state: "error", message: error.code, required_action: "fix_remote_host" }, true,
+      `The VPS step failed: ${error.code}. ${guidance(error.code)}`);
+  }
+}
+
+function announceListChanged() {
+  setTimeout(() => {
+    writeResponse({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    writeResponse({ jsonrpc: "2.0", method: "notifications/resources/list_changed" });
+  }, 0);
+}
+
+// --- strategy migration (Live, D1) ---------------------------------------------------------
+
+// What moves with the user: each account's custom strategies, strategy configurations and
+// installed strategy packages (without their backtest runs). Credentials, trading journals,
+// sign-in tokens and downloaded data never move. The account key is derived from the user and
+// Marketplace, so the same account on the VPS finds them after it signs in.
+function migrationInventory() {
+  const live = process.env.ALGOROVER_LIVE_STATE_ROOT ?? join(homedir(), ".algorover");
+  const accounts = join(live, "accounts");
+  const items = [];
+  let bytes = 0, tooLarge = false;
+  const walk = (directory, relative, item) => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory, name);
+      const metadata = lstatSync(path);
+      if (metadata.isSymbolicLink()) continue;
+      if (metadata.isDirectory()) {
+        if (relative.length === 2 && relative[0] === "strategies" && (name === "runs" || name === ".descriptor")) continue;
+        if (name === "__pycache__") continue;
+        walk(path, [...relative, name], item);
+      } else if (metadata.isFile()) {
+        if (metadata.size > MIGRATION_MAX_FILE_BYTES) { tooLarge = true; continue; }
+        bytes += metadata.size;
+        item.files.push({ path: [...relative, name].join("/"), source: path, size: metadata.size });
+      }
+    }
+  };
+  let accountNames = [];
+  try { if (lstatSync(accounts).isDirectory()) accountNames = readdirSync(accounts).filter((name) => /^[0-9a-f]{64}$/u.test(name)); } catch { accountNames = []; }
+  for (const account of accountNames) {
+    const accountRoot = join(accounts, account);
+    if (lstatSync(accountRoot).isSymbolicLink() || !lstatSync(accountRoot).isDirectory()) continue;
+    for (const area of ["custom-strategies", "strategy-configurations", "strategies"]) {
+      const areaRoot = join(accountRoot, area);
+      let names = [];
+      try { if (lstatSync(areaRoot).isDirectory() && !lstatSync(areaRoot).isSymbolicLink()) names = readdirSync(areaRoot); } catch { names = []; }
+      for (const name of names) {
+        if (name.startsWith(".") || name === "__init__.py" || name === "__pycache__") continue;
+        const path = join(areaRoot, name);
+        const metadata = lstatSync(path);
+        if (metadata.isSymbolicLink()) continue;
+        const item = { account, top: `${area}/${name}`, files: [] };
+        if (metadata.isDirectory()) walk(path, [area, name], item);
+        else if (metadata.isFile() && metadata.size <= MIGRATION_MAX_FILE_BYTES) { bytes += metadata.size; item.files.push({ path: `${area}/${name}`, source: path, size: metadata.size }); }
+        if (item.files.length) items.push(item);
+      }
+    }
+  }
+  return { accounts: accountNames.length, items: items.length, bytes, too_large: tooLarge || bytes > MIGRATION_MAX_BYTES, list: items };
+}
+
+async function migrateToRemote(destination, inventory) {
+  if (inventory.list.length === 0) return { copied: 0, skipped: 0 };
+  const items = inventory.list.map((item) => ({ account: item.account, top: item.top, files: item.files.map((file) => {
+    const bytes = readBoundedRegularFile(file.source, MIGRATION_MAX_FILE_BYTES);
+    if (bytes === null) throw new BridgeError("migration_source_changed");
+    return { path: file.path, data: bytes.toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") };
+  }) }));
+  const program = `import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+const items = ${JSON.stringify(items)};
+const live = join(homedir(), ".algorover");
+const safe = (path) => path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+let copied = 0, skipped = 0;
+for (const item of items) {
+  if (!/^[0-9a-f]{64}$/.test(item.account) || !safe(item.top)) { process.stderr.write("AlgoRover remote: remote_path_invalid\\n"); process.exit(6); }
+  const account = join(live, "accounts", item.account);
+  const target = join(account, ...item.top.split("/"));
+  if (existsSync(target)) { skipped += 1; continue; }
+  const temporary = join(account, ".migrating-" + randomUUID());
+  for (const file of item.files) {
+    if (!safe(file.path) || !file.path.startsWith(item.top)) { rmSync(temporary, { recursive: true, force: true }); process.stderr.write("AlgoRover remote: remote_path_invalid\\n"); process.exit(6); }
+    const path = join(temporary, ...file.path.split("/"));
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, Buffer.from(file.data, "base64"), { mode: 0o600 });
+    if (createHash("sha256").update(readFileSync(path)).digest("hex") !== file.sha256) { rmSync(temporary, { recursive: true, force: true }); process.stderr.write("AlgoRover remote: migration_corrupt\\n"); process.exit(7); }
+  }
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  renameSync(join(temporary, ...item.top.split("/")), target);
+  rmSync(temporary, { recursive: true, force: true });
+  copied += 1;
+}
+process.stdout.write(JSON.stringify({ schema: "algorover-remote-migration-v1", copied, skipped }) + "\\n");
+`;
+  const result = await runSsh(destination, remoteShell("exec \"$N\" --input-type=module -"), { input: program, timeoutMs: 600_000 });
+  if (result.code !== null) throw new BridgeError(result.code);
+  const value = lastJsonLine(result.stdout);
+  return { copied: value.copied, skipped: value.skipped };
+}
+
+// --- Dashboard tunnel ----------------------------------------------------------------------
+
+function readTunnels() {
+  const value = readPrivateJson(remoteTunnelsPath);
+  return Array.isArray(value?.tunnels) ? value.tunnels.filter((item) => REMOTE_DASHBOARD_PORTS.includes(item?.port) && Number.isSafeInteger(item?.pid) && item.pid > 0) : [];
+}
+
+function processCommandLine(pid) {
+  try {
+    if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
+    if (process.platform === "darwin") {
+      const result = spawnSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
+      return result.status === 0 ? result.stdout.trim() : null;
+    }
+    if (process.platform === "win32") {
+      const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: "utf8", timeout: 5000, windowsHide: true });
+      return result.status === 0 ? result.stdout.trim() : null;
+    }
+  } catch { return null; }
+  return null;
+}
+
+// Only a process whose command line is this tunnel is ever treated as ours (PIDs are reused).
+function ownTunnel(entry) {
+  const command = processCommandLine(entry.pid);
+  return typeof command === "string" && /\bssh(?:\.exe)?\b/u.test(command) && command.includes(`127.0.0.1:${entry.port}:127.0.0.1:${entry.port}`);
+}
+
+function portOpen(port) {
+  return new Promise((accept) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    const done = (value) => { socket.destroy(); accept(value); };
+    socket.setTimeout(400, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+
+// Tunnels this process verified recently: a command-line check costs a PowerShell start on Windows.
+const verifiedTunnels = new Map();
+
+async function ensureTunnel(port) {
+  if (remoteTarget === null || !REMOTE_DASHBOARD_PORTS.includes(port)) return "not_remote";
+  const tunnels = readTunnels();
+  const current = tunnels.find((item) => item.port === port);
+  const recent = current !== undefined && verifiedTunnels.get(port)?.pid === current.pid && Date.now() - verifiedTunnels.get(port).at < 60_000;
+  const alive = current !== undefined && (recent || ownTunnel(current));
+  if (alive) verifiedTunnels.set(port, { pid: current.pid, at: recent ? verifiedTunnels.get(port).at : Date.now() });
+  if (alive && await portOpen(port)) return "ok";
+  if (!alive && await portOpen(port)) return "local_dashboard_port_in_use";
+  let child;
+  try {
+    child = spawn("ssh", [...sshOptions({ forwarding: true }), "-N", "-L", `127.0.0.1:${port}:127.0.0.1:${port}`, ...sshDestination(remoteTarget.destination)],
+      { detached: true, stdio: "ignore", windowsHide: true, env: sshEnvironment() });
+  } catch { return "ssh_missing"; }
+  const exited = new Promise((accept) => { child.once("exit", () => accept(true)); child.once("error", () => accept(true)); });
+  child.unref();
+  writePrivateJson(remoteTunnelsPath, { schema: "algorover-remote-tunnels-v1", tunnels: [...tunnels.filter((item) => item.port !== port), { port, pid: child.pid, started_at: new Date().toISOString() }] });
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    if (await portOpen(port)) return "ok";
+    if (await Promise.race([exited, new Promise((accept) => setTimeout(() => accept(false), 250))])) return "tunnel_failed";
+  }
+  return "tunnel_timeout";
+}
+
+function stopTunnels() {
+  verifiedTunnels.clear();
+  for (const entry of readTunnels()) {
+    if (ownTunnel(entry)) { try { process.kill(entry.pid); } catch { /* already gone */ } }
+  }
+  rmSync(remoteTunnelsPath, { force: true });
+}
+
+// Every loopback Dashboard origin a VPS result links to gets its tunnel before the link is shown.
+async function ensureTunnelsFor(value) {
+  const ports = new Set();
+  const text = JSON.stringify(value ?? null);
+  for (const match of text.matchAll(/http:\/\/127\.0\.0\.1:(\d{2,5})/gu)) {
+    const port = Number(match[1]);
+    if (REMOTE_DASHBOARD_PORTS.includes(port)) ports.add(port);
+  }
+  const failures = [];
+  for (const port of ports) {
+    const state = await ensureTunnel(port);
+    if (state !== "ok") failures.push(`${port}:${state}`);
+  }
+  return failures;
+}
+
+// --- the MCP channel to the VPS copy -------------------------------------------------------
+
+class RemoteChannel {
+  constructor(destination) {
+    this.destination = destination;
+    this.child = null;
+    this.pending = new Map();
+    this.next = 0;
+    this.opening = null;
+    this.stderr = "";
+    this.runtimeId = null;
+    this.closed = false;
+  }
+
+  get alive() { return this.child !== null && this.opening === null; }
+
+  open() {
+    if (this.child !== null && this.opening === null) return Promise.resolve(this);
+    if (this.opening === null) this.opening = this.#start().finally(() => { this.opening = null; });
+    return this.opening;
+  }
+
+  async #start() {
+    try { await this.#spawn(); } catch (error) {
+      if (!(error instanceof BridgeError) || error.code !== "remote_plugin_missing") throw error;
+      await syncRemotePlugin(this.destination);
+      await this.#spawn();
+    }
+    return this;
+  }
+
+  #spawn() {
+    const command = remoteShell(`D=${remoteCopyDirectory()}; [ -f "$D/resolver.mjs" ] || { echo "AlgoRover remote: remote_plugin_missing" >&2; exit 4; }; ALGOROVER_RUNTIME_PLACEMENT=remote ALGOROVER_ENV=production; export ALGOROVER_RUNTIME_PLACEMENT ALGOROVER_ENV; exec "$N" "$D/resolver.mjs" ${profile}`);
+    mkdirSync(remoteRoot, { recursive: true, mode: 0o700 });
+    let child;
+    try {
+      child = spawn("ssh", [...sshOptions(), ...sshDestination(this.destination), command], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: sshEnvironment() });
+    } catch { return Promise.reject(new BridgeError("ssh_missing")); }
+    this.child = child;
+    this.stderr = "";
+    child.stdin.on("error", () => { /* reported through close */ });
+    child.stderr.on("data", (chunk) => { this.stderr = (this.stderr + chunk.toString("utf8")).slice(-16 * 1024); });
+    let buffer = "";
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      if (Buffer.byteLength(buffer, "utf8") > REMOTE_MAX_LINE_BYTES && !buffer.includes("\n")) { child.kill(); return; }
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (line) this.#receive(line);
+      }
+    });
+    const closed = new Promise((accept) => {
+      child.once("error", (error) => accept(error?.code === "ENOENT" ? "ssh_missing" : "ssh_failed"));
+      child.once("close", (status) => accept(sshFailureCode({ status, stderr: this.stderr })));
+    });
+    closed.then((code) => {
+      if (this.child === child) this.child = null;
+      for (const [, waiter] of this.pending) waiter.reject(new BridgeError(code === "remote_command_failed" ? "remote_disconnected" : code));
+      this.pending.clear();
+    });
+    const closedFailure = closed.then((code) => { throw new BridgeError(code === "remote_command_failed" ? "remote_disconnected" : code); });
+    closedFailure.catch(() => { /* observed through the race below or a later request */ });
+    return Promise.race([
+      this.#call("initialize", { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: `algorover-remote-bridge-${profile}`, version: productVersion } }, REMOTE_CONNECT_TIMEOUT_MS)
+        .then((response) => {
+          if (!isPlainObject(response?.result)) throw new BridgeError("remote_initialize_failed");
+          this.runtimeId = typeof response.result.serverInfo?.runtimeId === "string" ? response.result.serverInfo.runtimeId : null;
+          this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
+        }),
+      closedFailure,
+    ]);
+  }
+
+  #receive(line) {
+    let message;
+    try { message = JSON.parse(line); } catch { return; }
+    if (!isPlainObject(message)) return;
+    if (typeof message.method === "string" && !Object.hasOwn(message, "id")) {
+      // Only notifications travel back unasked; a list change also drops the cached annotations.
+      if (message.method.startsWith("notifications/")) {
+        if (message.method === "notifications/tools/list_changed") remoteToolAnnotations = new Map();
+        writeResponse(message);
+      }
+      return;
+    }
+    const waiter = this.pending.get(message.id);
+    if (waiter === undefined) return;
+    this.pending.delete(message.id);
+    waiter.accept(message);
+  }
+
+  #write(message) {
+    if (this.child === null) throw new BridgeError("remote_disconnected");
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  #call(method, params, timeoutMs) {
+    const id = `algorover-remote-${++this.next}`;
+    return new Promise((accept, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new BridgeError("remote_timeout")); }, timeoutMs);
+      this.pending.set(id, { accept: (value) => { clearTimeout(timer); accept(value); }, reject: (error) => { clearTimeout(timer); reject(error); } });
+      try { this.#write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+    });
+  }
+
+  async request(method, params, timeoutMs) {
+    await this.open();
+    return this.#call(method, params, timeoutMs);
+  }
+
+  notify(method, params) {
+    if (this.child === null) return;
+    try { this.#write({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) }); } catch { /* the next request reconnects */ }
+  }
+
+  close() {
+    this.closed = true;
+    if (this.child !== null) { try { this.child.stdin.end(); this.child.kill(); } catch { /* already gone */ } }
+    this.child = null;
+  }
+}
+
+async function openRemote() {
+  if (remoteTarget === null) throw new BridgeError("remote_not_configured");
+  if (remoteChannel === null || !sameDestination(remoteTarget.destination, remoteChannel.destination)) {
+    remoteChannel?.close();
+    remoteChannel = new RemoteChannel(remoteTarget.destination);
+  }
+  const reconnect = !remoteChannel.alive;
+  await remoteChannel.open();
+  if (reconnect) {
+    // A VPS Runtime replaced since this conversation started ends it, as on this computer.
+    if (remoteAdmittedRuntimeId !== null && remoteChannel.runtimeId !== null && remoteChannel.runtimeId !== remoteAdmittedRuntimeId) remoteStale = true;
+    if (remoteAdmittedRuntimeId === null) remoteAdmittedRuntimeId = remoteChannel.runtimeId;
+  }
+  return remoteChannel;
+}
+
+function remoteUnreachableStatus(code) {
+  return { state: "error", profile, plugin_id: pluginId, environment: delivery.environment,
+    version: productVersion, plugin_version: pluginVersion, expected_product_version: boundVersion,
+    runtime_version: null, runtime_contract_version: null, runtime_id: null, bootstrap_installed: existsSync(configuredBootstrapPath()),
+    lifecycle: null, connection_ready: false, repair_allowed: false, required_action: "check_remote_connection", message: code, placement: "remote" };
+}
+
+function remoteUnreachableResult(code) {
+  return { content: [{ type: "text", text: `AlgoRover runs on the VPS ${destinationLabel(remoteTarget?.destination ?? null)}, which cannot be reached right now (${code}). ${SSH_GUIDANCE[code] ?? ""} Strategies already running on the VPS keep running. Use algorover_runtime_target status to check again.` }],
+    structuredContent: remoteUnreachableStatus(code), isError: true };
+}
+
+function switchedResult() {
+  return { content: [{ type: "text", text: "AlgoRover moved to another location during this conversation. Ask the user to start a new conversation; do not call other AlgoRover tools here." }],
+    structuredContent: staleSession({ profile, plugin_id: pluginId, environment: delivery.environment,
+      version: productVersion, plugin_version: pluginVersion, expected_product_version: boundVersion, runtime_version: null,
+      runtime_contract_version: null, runtime_id: null, bootstrap_installed: existsSync(configuredBootstrapPath()), lifecycle: null }), isError: true };
+}
+
+function remoteErrorCode(error) { return error instanceof BridgeError ? error.code : "remote_unreachable"; }
+
+// Requests while this product runs on the VPS, or after a switch in this process. Returns
+// undefined for the few methods the local bridge answers itself.
+async function handleRemoteRequest(request) {
+  const id = request.id;
+  if (request.method === "ping") return undefined;
+  if (request.method === "initialize") {
+    return resultResponse(id, { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: { tools: { listChanged: true }, resources: { listChanged: true } },
+      serverInfo: { name: `algorover-ready-bridge-${profile}`, version: productVersion }, instructions: placementInstructions() });
+  }
+  if (placementSwitched) {
+    if (request.method === "tools/list") return resultResponse(id, { tools: [runtimeTargetTool()] });
+    if (request.method === "tools/call") return resultResponse(id, switchedResult());
+    if (request.method === "resources/list") return resultResponse(id, { resources: [] });
+    return errorResponse(id, -32001, "plugin_session_stale");
+  }
+  if (request.method === "tools/list") {
+    try {
+      const channel = await openRemote();
+      const response = await channel.request("tools/list", request.params ?? {}, REMOTE_LIST_TIMEOUT_MS);
+      const tools = Array.isArray(response?.result?.tools) ? response.result.tools.filter((tool) => tool?.name !== "algorover_runtime_target") : [];
+      remoteToolAnnotations = new Map(tools.map((tool) => [tool.name, tool.annotations ?? {}]));
+      return resultResponse(id, { tools: [runtimeTargetTool(), ...tools] });
+    } catch {
+      // Status and diagnosis stay listed so the user can still ask what is wrong.
+      return resultResponse(id, { tools: [runtimeTargetTool(), ...lifecycleTools(null).filter((tool) => ["algorover_runtime_status", "algorover_runtime_diagnose"].includes(tool.name))] });
+    }
+  }
+  if (request.method === "tools/call") {
+    const name = request.params?.name;
+    const local = name === "algorover_runtime_status" || name === "algorover_runtime_diagnose";
+    let response;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let channel;
+      try { channel = await openRemote(); } catch (error) { return resultResponse(id, remoteUnreachableResult(remoteErrorCode(error))); }
+      if (remoteStale && !LIFECYCLE_TOOL_NAMES.has(name) && !local) return resultResponse(id, switchedResult());
+      try {
+        response = await channel.request("tools/call", request.params, REMOTE_CALL_TIMEOUT_MS);
+        break;
+      } catch (error) {
+        const code = remoteErrorCode(error);
+        // A call that reached the VPS may have run: only read-only tools repeat, once, after a reconnect.
+        if (attempt === 0 && (local || remoteToolAnnotations.get(name)?.readOnlyHint === true) && ["remote_disconnected", "ssh_failed"].includes(code)) continue;
+        if (local) return resultResponse(id, remoteUnreachableResult(code));
+        return resultResponse(id, { content: [{ type: "text", text: `The connection to the VPS dropped during ${name} (${code}); whether it ran is unknown. Check the result (status or the Dashboard) before repeating it.` }],
+          structuredContent: { ...remoteUnreachableStatus(code), message: "remote_result_unknown" }, isError: true });
+      }
+    }
+    const result = response?.result;
+    if (name === "algorover_runtime_status" && Array.isArray(result?.content) && result.content[0]?.type === "text") {
+      result.content[0] = { ...result.content[0], text: `Runs on the VPS ${destinationLabel(remoteTarget.destination)}. ${result.content[0].text}` };
+    }
+    if (LIFECYCLE_TOOL_NAMES.has(name) && result?.structuredContent?.state === "ready" && typeof result.structuredContent.runtime_id === "string") {
+      remoteAdmittedRuntimeId = result.structuredContent.runtime_id;
+      remoteStale = false;
+    }
+    if (result !== undefined) {
+      const failures = await ensureTunnelsFor(result);
+      if (failures.length && Array.isArray(result.content)) {
+        result.content = [...result.content, { type: "text", text: `Dashboard tunnel to the VPS is not ready (${failures.join(", ")}); the link may not open until it is.` }];
+      }
+    }
+    return { ...response, id };
+  }
+  try {
+    const channel = await openRemote();
+    const timeout = request.method === "resources/read" ? REMOTE_LIST_TIMEOUT_MS : REMOTE_CALL_TIMEOUT_MS;
+    const response = await channel.request(request.method, request.params, timeout);
+    return { ...response, id };
+  } catch (error) {
+    return errorResponse(id, -32001, request.method.startsWith("resources/") ? "runtime_not_ready" : remoteErrorCode(error));
+  }
+}
+
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
 for await (const line of input) {
   if (!line.trim()) continue;
@@ -1344,3 +2665,5 @@ for await (const line of input) {
     writeResponse(errorResponse(request?.id ?? null, -32603, code));
   }
 }
+// The client closed stdin: end the VPS conversation so this process can exit.
+remoteChannel?.close();

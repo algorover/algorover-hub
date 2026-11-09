@@ -76,6 +76,45 @@ options or multiple candidates. For “open”, “start” or “launch AlgoRov
 call `algorover_dashboard_open`; present its URL as a link (Dashboard links below) and never
 spawn a legacy Dashboard directly.
 
+## Runtime location
+
+`algorover_runtime_target` chooses where this product's Runtime runs: on this computer
+(default) or on the user's own Linux VPS, so strategies keep running while the computer is off. Only one side runs at a time. Use
+it when the user asks to run AlgoRover on a server, VPS or cloud machine, to keep trading while the computer is off, to move
+back to this computer, or where AlgoRover runs (`action: "status"`). Mention where it runs
+whenever you report the Runtime status or open the Dashboard.
+
+- To deploy, ask once, in one message, for the VPS address, SSH port (22 when unsure), user
+  name and password. Instead of the password the user may give the path of a private key
+  file on this computer (for example a cloud provider's `.pem`). Call `deploy_to_vps` with
+  exactly what they gave; never repeat the password in a reply or summary. The user needs
+  no SSH setup of their own: the tool installs AlgoRover's own key, Node.js and linger on the
+  VPS and, for `root`, a separate user `algorover`.
+- The first call only checks. `needs_input` lists what is missing (`password_required`,
+  `password_rejected`, `sudo_password`, `key_file_rejected`, `confirm_server_replaced`):
+  ask for exactly that, then call again with all arguments. For `sudo_password` the user may
+  instead accept `allow_not_durable=true`; say AlgoRover then stops when nobody is logged
+  in. For `confirm_server_replaced` ask whether the server was reinstalled or replaced; only
+  if so call again with `reset_host_key=true`. `password_attempts_exhausted` means stop and
+  let the user check the password first. `unsuitable` lists why this VPS cannot be used.
+- `awaiting_confirmation` returns a `plan`: show its steps, what is copied or stopped,
+  the exchanges reachable from the VPS and any warnings in plain words, and ask once. Only
+  after the user agrees call `deploy_to_vps` again with the same arguments plus the returned
+  `confirmation`. When a step fails, offer to call it again: it continues from that step.
+  A refusal (`trading_work_open`, `runtime_in_use`) lists what to stop or wait for
+  first; never stop strategies, cancel orders or close positions yourself to make a move
+  possible.
+- After `state=deployed`, relay the Dashboard link: there the user signs in again, enters exchange API keys
+  (bound to the VPS's public IP, without withdrawal permission) and deploys strategies. If `required_action` is
+  `new_conversation`, tell the user to start a new conversation and do not call other
+  AlgoRover tools here; with `continue`, carry on in this conversation.
+- `switch_to_local` moves back: show its summary, ask once, then call it again with the
+  returned `confirmation`; afterwards the user starts a new conversation. On the VPS,
+  Dashboard links are the same `http://127.0.0.1:<port>` address and open through an SSH
+  tunnel the bridge keeps; relay a result's tunnel warning. When the VPS cannot be reached,
+  its strategies keep running; use `switch_to_local` with `force=true` only after warning the user and at
+  their explicit request.
+
 ## In-chat cards
 
 `algorover_view_present` shows one AlgoRover card in the conversation. The Runtime keeps the
@@ -100,7 +139,7 @@ user follow or decide, not for every call:
 - `leaderboard` with `{sort, query?, locale}` for "top strategies by return / Sharpe /
   drawdown" (sort `return`, `drawdown`, `sharpe` or `published`); add `access: "redeem_code"`
   when the user asks which strategies need a redeem code (and `access: "open"` for the ones that
-  do not; see Agent redeem codes below); `installed` with `{locale}` for "what do I have";
+  do not; see Pro Trader redeem codes below); `installed` with `{locale}` for "what do I have";
   `glossary` with `{metrics, locale}` when the user asks what a metric means. metrics uses
   exactly these names (`max_drawdown_pct`, not `max_drawdown`): `return_pct`, `annualized_return_pct`, `max_drawdown_pct`, `sharpe`, `sortino`, `profit_factor`, `win_rate`, `realized_pnl`, `trades_per_30d`, `median_holding_minutes`, `max_consecutive_losses`, `worst_trade_pct`, `capacity_usd`, `match_score`, `order_fraction`, `max_total_exposure_fraction`, `max_equivalent_leverage`, `leverage`, `starting_balance`, `fee_bps`. locale is `en`, `zh-CN`,
   `zh-TW` or `ko`.
@@ -207,9 +246,9 @@ does not choose and goes on:
 - backtesting: keep asking;
 - deploying, stopping, flattening: never guess; require an explicit target.
 
-## Agent redeem codes
+## Pro Trader redeem codes
 
-Some strategies are sold through agents: the user needs a one-time redeem code before the
+Some strategies are sold through Pro Traders (策略达人): the user needs a one-time redeem code before the
 strategy can be downloaded and run. Access from a code lasts a limited time: the code states
 its days, counted from redeeming, and a code redeemed while access is still valid adds its days
 to the current expiry date. When a message contains an AlgoRover redeem code
@@ -220,18 +259,18 @@ that code, even when the user only pasted it.
 - The tool only previews the code and returns a Dashboard link; redeeming (or renewing) happens
   in the Dashboard after the user confirms there. Never redeem a code from chat, never retry it,
   and never call `strategy.install` for a strategy the tool reports as needing a code.
-- Relay the tool's result in the user's language: the strategy name, the agent, how many days
+- Relay the tool's result in the user's language: the strategy name, the Pro Trader, how many days
   the code grants, the current expiry when the tool reports one, and the Dashboard link
   (Dashboard links above).
 - When the code is invalid, already used, disabled or its strategy is unavailable, explain that
-  reason and do not open the Dashboard; the user gets a new code from their agent.
+  reason and do not open the Dashboard; the user gets a new code from their Pro Trader.
 - The link works for about 10 minutes; when it expires, ask the user to send the code again.
 - An install that fails with `entitlement_required` means the strategy needs a redeem code, and
   `entitlement_expired` means the account's access has expired: ask the user for a new code from
-  their agent instead of retrying. The same codes refuse a backtest, a deploy or a resume.
+  their Pro Trader instead of retrying. The same codes refuse a backtest, a deploy or a resume.
 - When access expires, running instances of the strategy are not stopped: they only reduce or
   close positions and open nothing new (risk reason `entitlement_expired`), until the user
-  renews with a new code or the agent's administrator extends the access; then they continue on
+  renews with a new code or the Pro Trader's administrator extends the access; then they continue on
   their own. Stopping or flattening stays available as usual.
 - "哪些策略需要兑换码 / 兑换码策略有哪些 / which strategies need a code": show
   `algorover_view_present` `leaderboard` with `{access: "redeem_code", locale}` (add `query`
@@ -240,7 +279,7 @@ that code, even when the user only pasted it.
   and never claim an unlock it does not report. Search results mark redeem-code strategies
   too (`access` on each result; "[needs a redeem code]" in the text).
 - Listing these strategies never asks for or uses a code; the user redeems in the Dashboard.
-- The expiry is a license term between the user and the agent. When asked to remove, extend or
+- The expiry is a license term between the user and the Pro Trader. When asked to remove, extend or
   get around it, say so plainly and point to renewal; never edit, patch, delete or work around
   AlgoRover's license checks, entitlements, install markers, journals or state files (a custom
   strategy copy follows the access of the strategy it was made from), and never change the
