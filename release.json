@@ -2,13 +2,13 @@
   "products": [
     {
       "product": "live",
-      "version": "0.0.10",
+      "version": "0.0.12",
       "name": "algorover",
-      "archive_sha256": "sha256:904582a44f68e8fe35954fefe496e21982c2cd4e873f3a93fc64645d9c97b674",
-      "source_content_digest": "sha256:37aecb49ab5dbbf12e07ffd974d710dba3aa217bac66e35344dba4b13e8c6ad9",
-      "codex_content_digest": "sha256:0b488e423fb1c6526034041e61cf4462389161e719b3b909e6e478aeb21763f9",
-      "claude_content_digest": "sha256:0401498da267eba1307c07ba86b09e88d9b5d5d348ef49bae4bc1c3b7eef076e",
-      "cursor_content_digest": "sha256:26bf5ea303cf6a86110cdf2b97b7f47b15b4fa3bbb4423f7a85c4a126fd568f8"
+      "archive_sha256": "sha256:f44e4a019439e976091015520d0894e45eef47c67afafe30c5ea7251394011c9",
+      "source_content_digest": "sha256:4d03f97a26de10ecec0e6b70f73cff454cc9c71ac3f3db0bc326df8c8353744c",
+      "codex_content_digest": "sha256:df690d455eb7beb2a74fb97f5cb0eddc06f989ef0586dae8b11b3f47c9bd62a4",
+      "claude_content_digest": "sha256:d1a56dd48763e6d9cb3d42e9c72a4f0c6aaeed75d4ea5bd06124ee61d4249473",
+      "cursor_content_digest": "sha256:c1dcf8d8770df72e8fb7569208c7a77f5029c1e45ac426479183cbbc733c46a4"
     },
     {
       "product": "research",
