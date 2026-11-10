@@ -167,7 +167,7 @@ return { LifecycleTransaction, readLifecycleState, writeLifecycleState, runLiveM
 })();
 import * as __algorover_processes_dependency_0 from "node:child_process";
 import * as __algorover_processes_dependency_1 from "node:path";
-const { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse } = (() => {
+const { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse, managedTradingProcesses } = (() => {
 // Inventory and stop processes running a verified Runtime interpreter.
 const { spawnSync } = __algorover_processes_dependency_0;
 const { resolve, join } = __algorover_processes_dependency_1;
@@ -240,6 +240,39 @@ function runtimeProcessesByRole({ python, roles, birthOf, inventory = processInv
   });
 }
 
+function recoveryEnvironment(pid) {
+  const result = spawnSync("/bin/ps", ["eww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 3000, maxBuffer: 1024 * 1024 });
+  if (result.status !== 0) throw processFailure("runtime_process_identity_unverified");
+  // 只提取归属校验字段；原始进程环境不返回调用方，也不进入诊断日志。
+  return Object.fromEntries(["ALGOROVER_HOME", "ALGOROVER_RUNTIME_ID"].map(name =>
+    [name, new RegExp(`(?:^| )${name}=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)`, "su").exec(result.stdout.trim())?.[1]]));
+}
+
+/** 显式恢复的信号范围：已验证服务 PID 及其直属引擎，不能据失联推断账户没有工作。 */
+function managedTradingProcesses({ pid, runtimes, stateRoot, environment, birthOf,
+  inventory = processInventory, environmentOf = recoveryEnvironment }) {
+  const entries = inventory({ executables: runtimes.map(runtime => runtime.python) });
+  const supervisor = entries.find(entry => entry.pid === pid);
+  const runtime = runtimes.find(item => supervisor && classifyRuntimeCommand(item.python, supervisor.command) === "tradingd");
+  if (!runtime || !new RegExp(` -m algorover\\.tradingd --environment ${environment}$`, "u").test(supervisor.command))
+    throw processFailure("runtime_process_identity_unverified");
+  const selected = [supervisor, ...entries.filter(entry => entry.parent === pid
+    && classifyRuntimeCommand(runtime.python, entry.command) === "engine")];
+  const births = new Map(selected.map(entry => [entry.pid, birthOf(entry.pid)]));
+  // 一次复扫覆盖整个集合，避免账户数增加时反复扫描系统进程表。
+  const refreshed = new Map(inventory({ executables: [runtime.python] }).map(entry => [entry.pid, entry]));
+  return selected.map(entry => {
+    const birth = births.get(entry.pid);
+    // inventory 与 birth 之间也可能复用 PID；在 birth 两侧重新核对现场命令和父进程。
+    const current = refreshed.get(entry.pid);
+    const scope = environmentOf(entry.pid);
+    if (!birth || birthOf(entry.pid) !== birth || scope.ALGOROVER_HOME !== stateRoot
+        || scope.ALGOROVER_RUNTIME_ID !== runtime.runtimeId || current?.command !== entry.command
+        || current.parent !== entry.parent) throw processFailure("runtime_process_identity_unverified");
+    return { pid: entry.pid, birth, role: entry.pid === pid ? "tradingd" : "engine" };
+  });
+}
+
 async function stopAuthorizedProcesses(processes, { birthOf, signal = (pid, kind) => process.kill(pid, kind),
   exists = pid => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } },
   wait = milliseconds => new Promise(accept => setTimeout(accept, milliseconds)), gracefulMs = 5000, forcedMs = 2000 } = {}) {
@@ -266,7 +299,7 @@ async function stopAuthorizedProcesses(processes, { birthOf, signal = (pid, kind
   while (selected.some(remains) && Date.now() < deadline) await wait(50);
   if (selected.some(remains)) throw processFailure("runtime_process_stop_failed");
 }
-return { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse };
+return { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse, managedTradingProcesses };
 })();
 import * as __algorover_services_dependency_0 from "node:child_process";
 import * as __algorover_services_dependency_1 from "node:crypto";
@@ -570,6 +603,19 @@ class ServiceManager {
     return launcherFromDefinition(this.platform, content);
   }
 
+  /** 失联恢复只接受当前用户、当前环境且启动器属于本 Runtime home 的 macOS 服务。 */
+  recoveryPid(kind) {
+    if (!this.managed || this.platform !== "darwin") throw failure("runtime_process_identity_unverified");
+    const result = this.run("launchctl", ["print", this.#label(kind)]);
+    if (result.status !== 0 || !/\bstate = running\b/u.test(result.stdout)) return null;
+    const arguments_ = /\n\s*arguments = \{\n([\s\S]*?)\n\s*\}/u.exec(result.stdout)?.[1]
+      .split("\n").map(line => line.trim()).filter(Boolean);
+    const pid = Number(/\n\s*pid = (\d+)\s*\n/u.exec(result.stdout)?.[1]);
+    if (JSON.stringify(arguments_) !== JSON.stringify(["/bin/sh", this.launcher, kind])
+        || !Number.isSafeInteger(pid) || pid <= 0) throw failure("runtime_process_identity_unverified");
+    return pid;
+  }
+
   /**
    * Write the definition and load it when it is new or changed. A loaded trading
    * service is not reloaded for other edits: unloading it would drain every engine.
@@ -689,7 +735,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.12";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.13";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -1824,11 +1870,13 @@ function switchResult(transaction, state) {
 }
 
 /** The upgrade's readiness gate: release the trading hold once every engine migrated (D45). */
-async function resumeTradingAfterUpgrade(home, product) {
+export async function resumeTradingAfterUpgrade(home, product, control = tradingdCommand) {
   if (product !== "live") return null;
-  const result = await tradingdCommand(home, ["--resume-after-upgrade", "--wait", "300"], 330_000);
-  if (result?.result === "failed") fail("upgrade_trading_not_ready", `Trading stays paused: ${result.error?.code ?? "engines not ready"}`);
-  return result?.result ?? null;
+  const result = await control(home, ["--resume-after-upgrade", "--wait", "300"], 330_000);
+  // 包括已提交后的续做：只有交易监督进程明确确认就绪才能把 lifecycle 标为 ready。
+  if (!["resumed", "not_held"].includes(result?.result))
+    fail("upgrade_trading_not_ready", `Trading stays paused: ${result?.error?.code ?? "engines not ready"}`);
+  return result.result;
 }
 
 /**
@@ -1940,6 +1988,10 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
     const tradingAffected = product === "live" && previousId !== prepared.manifest.runtime_id;
     const inspect = async () => {
       const trading = tradingAffected ? await tradingdCommand(home, ["--status"]) : null;
+      // IPC 失联不等于没有交易；升级不得跳过工作确认后自动替换存活的服务。
+      if (tradingAffected && !trading?.running && (serviceManager(home, product, environmentName).active("tradingd")
+          || (old && runtimeProcessesByRole({ python: old.python, roles: ["tradingd", "engine"], birthOf: processBirth }).length)))
+        fail("trading_engine_unresponsive", "Trading state is unknown; explicitly recover the trading service before upgrading");
       const legacy = product === "live" ? await legacyTradingJobs(old, liveStateRoot) : { jobs: [] };
       const running = legacy.jobs.filter((job) => job.runtime_in_use);
       const unverified = running.filter((job) => job.runtime_id !== previousId || job.process_evidence !== "running");
@@ -2957,14 +3009,35 @@ function recordedHostAlive(stateRoot) {
  * (v2/11 section 2). The Host runs ``start`` and ``restart`` of the trading service
  * through the commands recorded in ``services.json`` (D43).
  */
-async function serviceCommand({ action, kind, force, home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin }) {
+export function managedTradingRecovery({ home, stateRoot, liveStateRoot, environmentName, services,
+  birthOf = processBirth, inventory, environmentOf }) {
+  const record = readServicesRecord(home);
+  if (record?.product !== "live" || record.environment !== environmentName
+      || record.tradingd_environment?.ALGOROVER_HOME !== liveStateRoot)
+    fail("runtime_process_identity_unverified", "Trading service scope cannot be verified");
+  const pid = services.recoveryPid("tradingd");
+  if (pid === null) return [];
+  const releases = join(stateRoot, "releases"), runtimes = [];
+  // current 已经提交时，仍须从同一 home 的已验证旧 release 识别存活监督进程。
+  for (const name of readdirSync(releases).filter(name => RELEASE_DIRECTORY.test(name) || LEGACY_RELEASE_DIRECTORY.test(name))) {
+    const root = join(releases, name);
+    if (lstatSync(root).isSymbolicLink()) continue;
+    const manifest = validateManifest(JSON.parse(readFileSync(join(root, "RUNTIME.json"), "utf8")), null);
+    if (manifestProduct(manifest) !== "live") continue;
+    runtimes.push({ python: safeDestination(root, manifest.payload.python.executable), runtimeId: manifest.runtime_id });
+  }
+  return managedTradingProcesses({ pid, runtimes, stateRoot: liveStateRoot, environment: environmentName,
+    birthOf, ...(inventory ? { inventory } : {}), ...(environmentOf ? { environmentOf } : {}) });
+}
+
+export async function serviceCommand({ action, kind, force, home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin,
+  services = serviceManager(home, product, environmentName), control = tradingdCommand, recovery = managedTradingRecovery, stopProcesses = stopAuthorizedProcesses }) {
   if (!["status", "start", "restart", "stop"].includes(action) || !["host", "tradingd"].includes(kind)) fail("usage", "service <status|start|restart|stop> --service host|tradingd");
   if (kind === "tradingd" && product !== "live") fail("usage", "Only Live has a trading service");
-  const services = serviceManager(home, product, environmentName);
   const status = async () => ({
     mode: readServicesRecord(home)?.mode ?? null,
     registered: services.registered(kind),
-    ...(kind === "tradingd" ? { tradingd: await tradingdCommand(home, ["--status"]) }
+    ...(kind === "tradingd" ? { tradingd: await control(home, ["--status"]) }
       : { host: await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), (await activeRuntime(stateRoot, null)).manifest.runtime_id) }),
   });
   if (action === "status") return { schema: "algorover-bootstrap-result-v1", service: await status() };
@@ -2979,15 +3052,21 @@ async function serviceCommand({ action, kind, force, home, stateRoot, pluginStat
     return { schema: "algorover-bootstrap-result-v1", service: await status() };
   }
   if (action !== "start") {
-    const drained = await tradingdCommand(home, ["--drain"], 180_000);
-    if (drained?.result === "failed") {
+    const drained = await control(home, ["--drain"], 180_000);
+    if (drained?.result === "failed" || (drained?.result === "not_running" && services.active("tradingd"))) {
       // An engine that does not answer cannot drain; only an explicit restart or a forced
       // stop ends it, by its command line (11 section 1.3).
       if (action === "stop" && !force) fail("trading_service_drain_timeout", "The trading service did not drain; use --force yes to stop it");
-      const runtime = await activeRuntime(stateRoot, null);
-      const python = safeDestination(runtime.root, runtime.manifest.payload.python.executable);
-      const processes = runtimeProcessesByRole({ python, roles: ["tradingd", "engine"], birthOf: processBirth });
-      await stopAuthorizedProcesses(processes, { birthOf: processBirth });
+      let processes;
+      if (drained?.result === "failed") {
+        // 已有的排空失败恢复保持跨平台行为；新分支只处理控制通道误报 not_running。
+        const runtime = await activeRuntime(stateRoot, null);
+        const python = safeDestination(runtime.root, runtime.manifest.payload.python.executable);
+        processes = runtimeProcessesByRole({ python, roles: ["tradingd", "engine"], birthOf: processBirth });
+      } else {
+        processes = recovery({ home, stateRoot, liveStateRoot, environmentName, services });
+      }
+      await stopProcesses(processes, { birthOf: processBirth });
     }
   }
   if (action !== "stop") {
