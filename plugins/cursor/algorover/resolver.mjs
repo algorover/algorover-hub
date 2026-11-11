@@ -78,9 +78,9 @@ const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`)
 const adjacentConnection = join(root, ".algorover-connection.json");
 let admittedRuntimeId = null;
 let bindingFailure = delivery.runtime_bindings.length > 0 && runtimeBinding === null ? "runtime_platform_unsupported" : null;
-// The Node that runs this bridge also runs Bootstrap. Older Nodes lack the fetch and stream
+// The Node that runs this bridge also runs Bootstrap. Nodes before 18 lack the fetch and stream
 // APIs Bootstrap needs and would fail without a readable cause, so refuse them up front.
-const MINIMUM_NODE_MAJOR = 20;
+const MINIMUM_NODE_MAJOR = 18;
 const nodeFailure = Number.parseInt(process.versions.node, 10) < MINIMUM_NODE_MAJOR ? "node_version_unsupported" : null;
 
 class BridgeError extends Error {
@@ -313,7 +313,7 @@ function lifecycleTools(runtimeId = null) {
   });
   if (profile === "live") tools.push({
     name: "algorover_redeem_code_open", title: "Open Redeem Code",
-    description: "Use when the user's message contains an AlgoRover agent redeem code (EP-XXXX-XXXX-XXXX-XXXX, any letter case, spaces allowed), for example \"请使用 AlgoRover 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略\". Reads which strategy and agent the code belongs to without using it, and returns a Dashboard link where the user signs in if needed, redeems and installs. Never redeem the code or install the strategy from chat.",
+    description: "Use when the user's message contains an AlgoRover agent redeem code (EP-XXXX-XXXX-XXXX-XXXX, any letter case, spaces allowed), for example \"请使用 AlgoRover 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略\". Reads which strategy and agent the code belongs to without using it, and returns a Dashboard link where the user signs in if needed, redeems and installs. A universal code belongs to no strategy: it can be used on any one Invite-only strategy, which the user chooses in the Dashboard. Never redeem the code, choose its strategy or install the strategy from chat.",
     inputSchema: { type: "object", properties: { code: { type: "string", minLength: 1, maxLength: 64 } }, required: ["code"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   });
@@ -329,7 +329,7 @@ function lifecycleTools(runtimeId = null) {
 
 const REDEEM_TARGET_CODE = /^[0-9A-Za-z-]{16,32}$/;
 // Live Dashboard pages a card may open; the Host contract's own list.
-const DASHBOARD_PAGES = ["strategies", "live", "tasks"];
+const DASHBOARD_PAGES = ["strategies", "live"];
 
 function completedOutput(result, operationId) {
   const outcomes = result?.structuredContent?.outcomes;
@@ -365,7 +365,8 @@ async function executeRedeemCodeOpen(value) {
         : `The redeem code could not be checked (${failure}). Ask the user to try again later.`;
     return redeemResult({ code_status: "unchecked", failure }, text, true);
   }
-  const { code_status: status, strategy, agent, viewer, validity_days: days } = outcome.output ?? {};
+  const { code_status: status, strategy, agent, viewer, validity_days: days, universal, claimed_strategy: spentOn } = outcome.output ?? {};
+  if (universal === true) return redeemUniversalCode(code, { status, viewer, days, spentOn });
   const facts = { code_status: status, strategy: { slug: strategy?.slug, name: strategy?.name }, agent: { display_name: agent?.display_name }, ...(Number.isInteger(days) ? { validity_days: days } : {}), ...(viewer ? { viewer } : {}) };
   const named = `the strategy "${strategy?.name}" (${strategy?.slug}), shared by agent ${agent?.display_name}`;
   // Access from a code lasts validity_days; a code used while access is still valid extends it from its expiry.
@@ -405,6 +406,27 @@ async function executeRedeemCodeOpen(value) {
   return redeemResult({ ...facts, dashboard_url: url }, `${text} ${url}`);
 }
 
+// A universal code belongs to no strategy or agent: the user spends it on one Invite-only strategy,
+// chosen in the Dashboard's redeem dialog, never in chat.
+async function redeemUniversalCode(code, { status, viewer, days, spentOn }) {
+  const used = spentOn && typeof spentOn.slug === "string" && typeof spentOn.name === "string" ? { slug: spentOn.slug, name: spentOn.name } : null;
+  const facts = { code_status: status, universal: true, ...(Number.isInteger(days) ? { validity_days: days } : {}), ...(used ? { claimed_strategy: used } : {}), ...(viewer ? { viewer } : {}) };
+  if (status === "used") {
+    return redeemResult(facts, used
+      ? `This account already used this universal redeem code on the strategy "${used.name}" (${used.slug}); a code can be used only once.`
+      : viewer?.used_by_viewer === true ? "This account already used this universal redeem code; a code can be used only once."
+        : viewer === undefined
+          ? "This universal redeem code has already been used. If the user redeemed it with their own account, ask them to sign in to the Dashboard, where the strategy they chose is available to that account."
+          : "This universal redeem code was already used by another account and cannot be used again.", true);
+  }
+  if (status !== "available") return redeemResult(facts, "This universal redeem code has been disabled and cannot be used.", true);
+  const grants = Number.isInteger(days) ? ` It grants ${days} days of access, counted from redeeming, or added to the current expiry when the account already holds the chosen strategy.` : "";
+  const opened = completedOutput(await executeHostOperation("dashboard.open", { target: { kind: "redeem", code } }), "dashboard.open");
+  const url = opened?.status === "completed" ? opened.output?.url : null;
+  if (!dashboardLoopbackUrl(url)) return redeemResult(facts, "The Dashboard could not be opened. Ask the user to open AlgoRover Dashboard and enter the code on the strategy page.", true);
+  return redeemResult({ ...facts, dashboard_url: url }, `This is a universal redeem code: it can be used on any one Invite-only strategy and is then used up.${grants} The user chooses the strategy in the Dashboard. Give the user this Dashboard link; they sign in if needed, choose the strategy, then redeem and install there. Do not choose a strategy for them, redeem or install from chat. The link works for about 10 minutes; if it expires, ask the user to send the code again: ${url}`);
+}
+
 function recommendationSchema() {
   const locale = { enum: ["en", "ko", "zh-CN", "zh-TW"] };
   return { type: "object", additionalProperties: false, properties: {
@@ -441,14 +463,13 @@ function liveDashboardTargetSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"}, {kind: \"trading_account\", venue, mode: \"demo\" | \"live\", instance_id (optional)} (the Live page at that account) or {kind: \"task\", view_id} (a conversation's task).",
+    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\"} or {kind: \"trading_account\", venue, mode: \"demo\" | \"live\", instance_id (optional)} (the Live page at that account).",
     properties: {
       ...strategy.properties,
-      kind: { enum: ["strategy", "custom_strategy", "page", "task", "trading_account"] },
+      kind: { enum: ["strategy", "custom_strategy", "page", "trading_account"] },
       custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
       revision: { type: "integer", minimum: 1, maximum: 999999 },
       page: { enum: DASHBOARD_PAGES },
-      view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" },
       venue: { type: "string", pattern: "^[A-Z][A-Z0-9_]{1,31}$" },
       mode: { enum: ["demo", "live"] },
       instance_id: { type: "string", pattern: "^si_[0-9a-z]{1,61}$" },
@@ -472,15 +493,10 @@ function dashboardArguments(value) {
   if (Object.keys(value).sort().join(",") !== "target" || value.target === null
       || typeof value.target !== "object" || Array.isArray(value.target)) throw new BridgeError("invalid_tool_call");
   const target = value.target;
-  // A Live page or a conversation's task: what in-chat cards hand over to (ADR 0022, ADR 0023).
+  // A Live page: what in-chat cards hand over to (ADR 0022).
   if (target.kind === "page" && profile === "live") {
     if (Object.keys(target).sort().join(",") !== "kind,page" || !DASHBOARD_PAGES.includes(target.page)) throw new BridgeError("invalid_tool_call");
     return { target: { kind: "page", page: target.page } };
-  }
-  if (target.kind === "task" && profile === "live") {
-    if (Object.keys(target).sort().join(",") !== "kind,view_id" || typeof target.view_id !== "string"
-        || !/^view_[0-9a-f]{32}$/.test(target.view_id)) throw new BridgeError("invalid_tool_call");
-    return { target: { kind: "task", view_id: target.view_id } };
   }
   // The Live page at one trading account, and one instance when given: what a monitor or incident card opens.
   if (target.kind === "trading_account" && profile === "live") {
