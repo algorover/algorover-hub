@@ -262,8 +262,15 @@ that code, even when the user only pasted it.
 - Relay the tool's result in the user's language: the strategy name, the Pro Trader, how many days
   the code grants, the current expiry when the tool reports one, and the Dashboard link
   (Dashboard links above).
+- A universal redeem code (通用兑换码, the tool reports `universal: true`; users get them from the
+  invite programme, shown under 我的邀请 in the Dashboard account page) belongs to no strategy and no
+  Pro Trader: it can be used on any one Invite-only strategy (达人策略) and is then used up. The user
+  chooses that strategy in the Dashboard after opening the link; say so, relay the days and the
+  link, and never choose the strategy for them. When they ask what they could use it on, show the
+  `leaderboard` card with `access: "redeem_code"` (below).
 - When the code is invalid, already used, disabled or its strategy is unavailable, explain that
-  reason and do not open the Dashboard; the user gets a new code from their Pro Trader.
+  reason and do not open the Dashboard; the user gets a new code from their Pro Trader. For a used
+  universal code the tool names the strategy it went to when this account used it.
 - The link works for about 10 minutes; when it expires, ask the user to send the code again.
 - An install that fails with `entitlement_required` means the strategy needs a redeem code, and
   `entitlement_expired` means the account's access has expired: ask the user for a new code from
