@@ -1,6 +1,6 @@
 ---
 name: algorover
-description: Route strategy discovery, configuration, custom strategies (changing a strategy's parameters, markets, logic or code as the user's own local copy), backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local AlgoRover Runtime Host. Use for AlgoRover Live workflows; never expose credentials or bypass confirmation gates.
+description: Route strategy discovery, funding rate and funding arbitrage lookups, configuration, custom strategies (changing a strategy's parameters, markets, logic or code as the user's own local copy), backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local AlgoRover Runtime Host. Use for AlgoRover Live workflows; never expose credentials or bypass confirmation gates.
 ---
 
 # AlgoRover Live router
@@ -212,8 +212,13 @@ Steps:
    the strategy fields, `backtest.markets` and every venue variant together. Tell the user the
    plan, especially `remove_venues` (exchanges that do not list the symbol), and call it again
    with `apply: true`, the plan's `preset_sha256` as `expected_sha256` and `remove_venues` only
-   after they agree. `custom_market_unsupported` means the preset has several markets or an
-   unsupported exchange: then edit the `strategy` instrument and bar fields and
+   after they agree. A strategy on several markets of one exchange (`market.kind` is `basket`
+   in `custom_strategy.get`, with one `slots` entry per symbol) takes `replacements` instead of
+   `symbol` and `timeframe`, e.g. `[{"from": "ETH", "to": "SOL"}]`: that symbol is replaced
+   everywhere, timeframes and the number of markets stay, and two slots cannot get one symbol;
+   plan, confirm and apply the same way. `custom_market_unsupported` means the preset cannot be
+   changed this way (markets on several exchanges, an unsupported exchange, a symbol that is
+   not offered): then edit the `strategy` instrument and bar fields and
    `backtest.markets` (and `venue_variants`) of `configs/default.json` together; a bar type is
    `<instrument_id>-<step>-<aggregation>-<price type>-<source>`, e.g.
    `BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL`, and every preset trades exactly one venue.
@@ -292,6 +297,33 @@ that code, even when the user only pasted it.
   strategy copy follows the access of the strategy it was made from), and never change the
   computer's clock for it.
 
+## Funding rates
+
+For any question about funding rates or spot/perpetual funding arbitrage (资金费率, 资金费率套利,
+期现套利, "which coins pay the most funding", "BTC funding on OKX"), call
+`algorover_funding_opportunities`. It reads AlgoRover's public funding data for Binance, OKX,
+Gate, Bitget and Bybit; it needs no sign-in and no exchange credentials, and it never trades.
+
+- Pass only what the user asked for: `asset` to compare one coin across exchanges, `exchange`
+  for one exchange, `direction` (`forward` = long spot + short perpetual, `reverse` = borrow and
+  sell spot + long perpetual), `min_open_interest_usd` to leave out illiquid contracts, `limit`
+  for how many rows. With no arguments it returns the ten highest predicted annualized rates.
+- The tool always answers. When `available` is false, tell the user in their language that the
+  funding rate data cannot be retrieved right now (and when it may work again if the tool says
+  so). Never fill in numbers from memory, and never present another source's numbers as
+  AlgoRover data. An empty list means nothing matched; say that instead.
+- Ratios are decimals: `0.0001` is 0.01%. Show percentages, state the calculation time, and name
+  the exchange and contract symbol of every row.
+- The annualized values are gross funding only. Whenever you discuss a return, say that fees,
+  slippage and borrow cost are not deducted, that the predicted rate can change before
+  settlement, and that a reverse pair needs the asset to be borrowable (not checked). Do not
+  call a listed rate a guaranteed, expected or net return.
+- Only single-exchange spot/perpetual pairs exist. For cross-exchange perpetual pairs, say
+  AlgoRover does not provide them yet; you may compare the same asset's rows across exchanges
+  when the user asks, labelled as your own comparison.
+- This is research data. Deploying a strategy still goes through the usual strategy,
+  configuration and confirmation flow; the funding tool starts nothing.
+
 ## Upgrade recovery
 
 This plugin's bound release replaces the installed Runtime even when its version number is lower. An interrupted switch of that same release still resumes forward. Trading runs in the separate local trading service, which
@@ -366,6 +398,22 @@ or recommend a strategy is not onboarding. Reply in the user's current language 
 conversation's language, then the host locale, and otherwise English.
 Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
 must go directly to that outcome and must not force the questionnaire.
+
+**Runtime location first.** For the production plugin, before step 1 call
+`algorover_runtime_target` with `action: "status"`. Only when `placement` is `local` and
+`local_runtime_installed` is false (a first installation), ask once where AlgoRover should
+run and end the turn; an existing installation or a VPS placement is never asked. Put both
+choices in one message, in the user's language:
+
+- this computer (default): ready right away; strategies stop while the computer is off or asleep;
+- the user's own Linux VPS: strategies keep running while the computer is off; it needs the
+  VPS address, SSH port, user name and password.
+
+Say that the location can be changed later. For this computer, or an answer with no clear
+preference, continue with step 1. For a VPS, follow **Runtime location** (`deploy_to_vps`)
+and continue with step 1 when it returns `required_action: continue`. When the VPS cannot
+be used (`unsuitable`, `password_attempts_exhausted`, or the user gives up), offer once to
+install on this computer instead; the VPS can still be deployed later.
 
 1. Call `algorover_runtime_status`, then `algorover_runtime_start` when the bound target
    needs starting, installation or recovery. Let the script decide whether to reuse,
@@ -456,6 +504,13 @@ Deploying is always two-stage. `trading.instance.prepare` validates and freezes 
 configuration and venue for ten minutes. `trading.instance.start` requires the attended
 confirmation bound to that exact `prepared_ref`. Never turn a generic “yes” into
 authorization and never place credentials in model arguments or prose.
+
+Trading accounts (one per exchange and mode, each with its own API key) run side by side: a
+deployment to one never waits for, stops or changes another, and each account still runs one
+instance. Every account that trades holds its own process, so before a deployment read
+`trading.service.status`: when `memory.low` is true, tell the user how much memory is free and
+that the system may end a strategy process if it runs out, then deploy if they still want to
+(nothing is refused).
 
 Trading commands (`start`, `stop`, `resume`, `halt`, `exposure.flatten`, `exposure.adopt`)
 return when the trading service recorded them; what happened at the exchange is read from

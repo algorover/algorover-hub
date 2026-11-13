@@ -13,6 +13,9 @@ const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MCP_FORWARD_TIMEOUT_MS = 210_000;
 const SEARCH_FORWARD_TIMEOUT_MS = 4_000;
+// Live asks the Server twice at most (4 s each) before it answers "unavailable"; leave room for that answer.
+const FUNDING_FORWARD_TIMEOUT_MS = 15_000;
+const FUNDING_TOOL_NAME = "algorover_funding_opportunities";
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://algorover/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const searchResultsResourceUri = (runtimeId) => `ui://algorover/strategy-search-results-v1/${runtimeId.slice("sha256:".length)}.html`;
@@ -102,7 +105,7 @@ async function handleRequest(request) {
   // On the VPS (ADR 0031), or after a switch in this process, the remote path answers.
   if (remoteTarget !== null || placementSwitched) {
     const response = await handleRemoteRequest(request);
-    if (response !== undefined) return response;
+    if (response !== undefined) return fundingRemoteResponse(request, response);
   }
   if (request.method === "initialize") {
     return resultResponse(id, {
@@ -124,6 +127,8 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
+    // Reads market data only and always answers: missing data is a normal "unavailable" result.
+    if (name === FUNDING_TOOL_NAME && profile === "live") return resultResponse(id, await executeFundingOpportunities(argumentsValue));
     if (!(name in LIFECYCLE_HANDLERS) && !CARD_TOOL_NAMES.has(name) && (HOST_TOOL_NAMES.has(name) || ["algorover_strategy_search", "algorover_strategy_recommend", "algorover_onboarding_open", "algorover_dashboard_open", "algorover_redeem_code_open"].includes(name))) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
@@ -317,6 +322,7 @@ function lifecycleTools(runtimeId = null) {
     inputSchema: { type: "object", properties: { code: { type: "string", minLength: 1, maxLength: 64 } }, required: ["code"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   });
+  if (profile === "live") tools.push(fundingTool());
   tools.push({
     name: "algorover_dashboard_open", title: "Open Dashboard",
     description: `Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.${profile === "live" ? " A custom_strategy target opens one of the user's custom strategies (custom_id from custom_strategy.*), at one revision when given." : ""}`,
@@ -325,6 +331,175 @@ function lifecycleTools(runtimeId = null) {
   });
   tools.push(runtimeTargetTool());
   return tools;
+}
+
+const FUNDING_EXCHANGES = Object.freeze({ binance: "Binance", okx: "OKX", gate: "Gate", bitget: "Bitget", bybit: "Bybit" });
+// Names a model may reasonably write for the five exchanges.
+const FUNDING_EXCHANGE_ALIASES = Object.freeze({ "gate.io": "gate", gateio: "gate", okex: "okx" });
+const FUNDING_DEFAULT_LIMIT = 10;
+const FUNDING_MAX_LIMIT = 30;
+const FUNDING_NOTES = Object.freeze([
+  "Annualized values are gross simple funding only (rate x periods per year): fees, slippage, borrow cost and stablecoin price differences are not deducted. They are not expected or net returns.",
+  "funding_rate is the predicted rate of the current period and can change before settlement; seven_day_annualized uses settled funding of the last seven 24-hour windows, signed for the current direction.",
+  "forward = long spot + short perpetual. reverse = borrow and sell spot + long perpetual; whether the asset can be borrowed, and at what cost, is not checked.",
+  "spread is the entry spread from the two order books (short leg bid / long leg ask - 1). open_interest_usd is one-sided open interest, not tradable depth.",
+  "USDC perpetuals are paired with USDT spot at 1:1. Only single-exchange spot/perpetual pairs are covered; cross-exchange pairs are not.",
+  "null means the value is unknown, not zero.",
+]);
+
+function fundingTool() {
+  return {
+    name: FUNDING_TOOL_NAME, title: "Funding Rate Opportunities",
+    description: "Look up current funding rates and single-exchange spot/perpetual funding arbitrage data from AlgoRover for Binance, OKX, Gate, Bitget and Bybit: predicted funding rate, settlement interval and next settlement time, predicted and seven-day annualized funding, entry spread, open interest, and the last seven daily settled totals. Use it for questions such as \"BTC 资金费率\", \"which coins have the highest funding rate on Bybit\", or funding arbitrage research. Every argument is optional: without any, the ten highest predicted annualized rates across all exchanges are returned; pass asset to compare one coin across exchanges. Ratios are decimals (0.0001 = 0.01%). This tool never fails: when the data cannot be read, available is false and reason says why; then tell the user the funding data is temporarily unavailable and do not invent numbers. It only reads public market data: it never places orders and needs no sign-in or exchange credentials.",
+    inputSchema: { type: "object", additionalProperties: false, required: [], properties: {
+      asset: { type: "string", maxLength: 40, description: "Base asset such as BTC or ETH (any letter case; BTCUSDT is read as BTC)." },
+      exchange: { type: "string", maxLength: 40, description: "One of binance, okx, gate, bitget, bybit (any letter case). Omit for all five." },
+      direction: { enum: ["forward", "reverse"], description: "forward: positive funding, long spot and short perpetual. reverse: negative funding, borrow and sell spot and long perpetual." },
+      sort: { enum: ["currentAnnualized", "sevenDayAnnualized"], description: "Annualized metric to sort by. Defaults to currentAnnualized (the predicted rate)." },
+      order: { enum: ["asc", "desc"], description: "Defaults to desc (highest first)." },
+      min_open_interest_usd: { type: "number", minimum: 0, description: "Keep only pairs whose one-sided perpetual open interest in USD is known and at least this, to leave out illiquid contracts." },
+      limit: { type: "integer", minimum: 1, maximum: FUNDING_MAX_LIMIT, description: `How many pairs to return. Defaults to ${FUNDING_DEFAULT_LIMIT}.` },
+    } },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  };
+}
+
+// Lenient on purpose: a recoverable argument is corrected or left out and reported in
+// ignored_arguments, because this tool answers every call instead of failing it.
+function fundingArguments(value) {
+  const request = { sort: "currentAnnualized", order: "desc", limit: FUNDING_DEFAULT_LIMIT };
+  const ignored = [];
+  let unsupportedExchange = null;
+  for (const [key, raw] of Object.entries(value)) {
+    if (raw === null || raw === undefined || raw === "") continue;
+    if (key === "asset" && typeof raw === "string") {
+      const upper = raw.trim().toUpperCase();
+      // "BTCUSDT", "BTC-USDT-SWAP", "BTC/USDT" and "BTC_USDT" all name the base asset BTC.
+      const base = /^([A-Z0-9]+?)[-_/]?(?:USDT|USDC)(?:[-_]?(?:SWAP|PERP))?$/.exec(upper)?.[1] ?? upper;
+      if (/^[A-Z0-9]{1,30}$/.test(base)) request.asset = base; else ignored.push(key);
+    } else if (key === "exchange" && typeof raw === "string") {
+      const name = raw.trim().toLowerCase();
+      const exchange = FUNDING_EXCHANGE_ALIASES[name] ?? name;
+      if (Object.hasOwn(FUNDING_EXCHANGES, exchange)) request.exchange = exchange; else unsupportedExchange = raw.trim().slice(0, 40);
+    } else if (key === "direction" && ["forward", "reverse"].includes(raw)) request.direction = raw;
+    else if (key === "sort" && ["currentAnnualized", "sevenDayAnnualized"].includes(raw)) request.sort = raw;
+    else if (key === "order" && ["asc", "desc"].includes(raw)) request.order = raw;
+    else if (key === "min_open_interest_usd" && typeof raw === "number" && Number.isFinite(raw) && raw >= 0 && raw <= 1e12) request.min_open_interest_usd = raw;
+    else if (key === "limit" && Number.isInteger(raw)) request.limit = Math.min(FUNDING_MAX_LIMIT, Math.max(1, raw));
+    else ignored.push(key);
+  }
+  return { request, ignored, unsupportedExchange };
+}
+
+function fundingUnavailable(reason, text, extra = {}) {
+  return {
+    content: [{ type: "text", text: `Funding rate data is temporarily unavailable (${reason}). ${text} Tell the user the funding rate data could not be retrieved right now; do not invent numbers and do not present data from another source as AlgoRover data.` }],
+    structuredContent: { schema: "algorover-funding-opportunities-v1", profile, available: false, reason, retryable: true,
+      retry_after_seconds: null, retrieved_at: Date.now(), calculated_at: null, updated_at: null, stale: null,
+      total: 0, matched_total: 0, items: [], notes: FUNDING_NOTES, ...extra },
+  };
+}
+
+const FUNDING_REASON_TEXT = Object.freeze({
+  network_unreachable: "The AlgoRover server could not be reached from the Runtime (network or proxy).",
+  rate_limited: "Too many funding data requests from this network in the last minute.",
+  service_unavailable: "The AlgoRover funding data service is not answering or its market data is older than five minutes.",
+  request_rejected: "The AlgoRover server did not accept this request.",
+  response_invalid: "The AlgoRover server returned data in an unexpected shape.",
+  unexpected_failure: "The Runtime could not complete the read.",
+});
+
+async function executeFundingOpportunities(value) {
+  try {
+    const { request, ignored, unsupportedExchange } = fundingArguments(value);
+    const extra = { request, ...(ignored.length ? { ignored_arguments: ignored } : {}) };
+    if (unsupportedExchange !== null) {
+      return { ...fundingUnavailable("exchange_not_supported", `"${unsupportedExchange}" is not covered; funding data covers ${Object.values(FUNDING_EXCHANGES).join(", ")} only.`, { ...extra, retryable: false }),
+        content: [{ type: "text", text: `AlgoRover funding data does not cover "${unsupportedExchange}". It covers ${Object.values(FUNDING_EXCHANGES).join(", ")} only. Tell the user, and offer one of those exchanges or all of them.` }] };
+    }
+    const notReady = await ensureForUse();
+    if (notReady !== null) return fundingRuntimeNotReady(notReady, extra);
+    const result = await executeHostOperation("market.funding.opportunities", request, FUNDING_FORWARD_TIMEOUT_MS);
+    if (result?.isError === true) return fundingRuntimeNotReady(result.structuredContent ?? {}, extra);
+    const outcome = completedOutput(result, "market.funding.opportunities");
+    const output = outcome?.output;
+    if (outcome?.status !== "completed" || output === null || typeof output !== "object" || typeof output.available !== "boolean" || !Array.isArray(output.items)) {
+      const failure = typeof outcome?.failure?.code === "string" ? outcome.failure.code : "result_invalid";
+      return fundingUnavailable("runtime_unavailable", `The Runtime did not complete the read (${failure}).`, { ...extra, failure });
+    }
+    const payload = { schema: "algorover-funding-opportunities-v1", profile, ...output, notes: FUNDING_NOTES, ...extra };
+    if (output.available !== true) {
+      const reason = typeof output.reason === "string" ? output.reason : "service_unavailable";
+      const wait = Number.isInteger(output.retry_after_seconds) ? ` It may work again in about ${output.retry_after_seconds} seconds.` : output.retryable === false ? "" : " It may work again shortly.";
+      return { ...fundingUnavailable(reason, `${FUNDING_REASON_TEXT[reason] ?? "The data could not be read."}${wait}`), structuredContent: payload };
+    }
+    return { content: [{ type: "text", text: fundingText(payload) }], structuredContent: payload };
+  } catch (error) {
+    const code = error instanceof BridgeError ? error.code : "bridge_internal_failure";
+    if (!(error instanceof BridgeError)) process.stderr.write(`AlgoRover MCP bridge diagnostic: ${error instanceof Error ? `${error.name}:${error.message}` : "unknown"}\n`);
+    // An installed Runtime from before this tool does not know the operation.
+    if (code === "operation_unavailable") {
+      return fundingUnavailable("runtime_update_required", "The installed AlgoRover Runtime is older than this plugin and cannot read funding data yet. Updating the Runtime (algorover_runtime_update) adds it; ask the user before updating.", { retryable: false, failure: code });
+    }
+    return fundingUnavailable(code === "host_timeout" ? "runtime_timeout" : "runtime_unavailable", `The local AlgoRover Runtime did not answer (${code}).`, { failure: code });
+  }
+}
+
+function fundingRuntimeNotReady(status, extra) {
+  const runtime = { state: status?.state ?? null, message: status?.message ?? null, required_action: status?.required_action ?? null };
+  return fundingUnavailable("runtime_not_ready", `The AlgoRover Runtime is not ready (state ${runtime.state ?? "unknown"}${runtime.message ? `, ${runtime.message}` : ""}), so the data cannot be read yet. algorover_runtime_status shows what it is waiting for.`, { ...extra, runtime });
+}
+
+// When the Runtime runs on the user's VPS the call is answered there; an unreachable VPS, or a
+// VPS plugin from before this tool, still becomes a normal "unavailable" answer.
+function fundingRemoteResponse(request, response) {
+  if (request.method !== "tools/call" || request.params?.name !== FUNDING_TOOL_NAME || profile !== "live") return response;
+  if (response?.error) {
+    return resultResponse(request.id, fundingUnavailable("runtime_update_required", "The AlgoRover plugin on the VPS is older than this one and cannot read funding data yet.", { retryable: false, failure: String(response.error.message ?? "tool_not_found") }));
+  }
+  if (response?.result?.isError === true) {
+    const status = response.result.structuredContent ?? {};
+    return resultResponse(request.id, fundingUnavailable("runtime_unreachable", `The AlgoRover Runtime on the VPS could not be reached (${status.message ?? "unknown"}).`, { runtime: { state: status.state ?? null, message: status.message ?? null, required_action: status.required_action ?? null } }));
+  }
+  return response;
+}
+
+function fundingPercent(value, digits = 2, signed = false) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  const text = (value * 100).toFixed(digits);
+  return `${signed && value > 0 ? "+" : ""}${text}%`;
+}
+
+function fundingUsd(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  return value >= 1e9 ? `$${(value / 1e9).toFixed(2)}B` : value >= 1e6 ? `$${(value / 1e6).toFixed(2)}M` : value >= 1e3 ? `$${(value / 1e3).toFixed(1)}K` : `$${value.toFixed(0)}`;
+}
+
+function fundingTime(value) {
+  return Number.isSafeInteger(value) && value > 0 ? new Date(value).toISOString().replace(/\.\d{3}Z$/, "Z") : "unknown";
+}
+
+// The model reads this text; structuredContent carries the same rows with every field.
+function fundingText(payload) {
+  const { request, items } = payload;
+  const filters = [request.asset && `asset ${request.asset}`, request.exchange && `exchange ${FUNDING_EXCHANGES[request.exchange]}`,
+    request.direction && `direction ${request.direction}`, request.min_open_interest_usd !== undefined && `open interest >= ${fundingUsd(request.min_open_interest_usd)}`].filter(Boolean);
+  const scope = `${filters.length ? filters.join(", ") : "all exchanges and assets"}; sorted by ${request.sort} ${request.order}`;
+  const ignored = payload.ignored_arguments?.length ? ` Ignored arguments that could not be read: ${payload.ignored_arguments.join(", ")}.` : "";
+  const freshness = `Calculated at ${fundingTime(payload.calculated_at)} UTC${payload.stale === true ? " (the server is refreshing; this is its last result)" : ""}.`;
+  if (items.length === 0) {
+    return `No AlgoRover funding rate pair matches (${scope}).${ignored} ${freshness} A pair is listed only while its predicted funding rate is not zero and fresh, and only for assets with both USDT spot and a linear perpetual on the same exchange. Tell the user nothing matched; do not invent numbers.`;
+  }
+  const rows = items.map((item, index) => {
+    const rate = Number(item.funding_rate);
+    return `${index + 1}. ${FUNDING_EXCHANGES[item.exchange] ?? item.exchange} ${item.symbol} (spot ${item.spot_symbol}), ${item.direction}: predicted rate ${fundingPercent(rate, 4, true)} per ${item.interval_hours}h, annualized ${fundingPercent(item.current_annualized)}, 7-day annualized ${item.seven_day_annualized === null ? "unknown (history incomplete)" : fundingPercent(item.seven_day_annualized, 2, true)}, entry spread ${fundingPercent(item.spread, 3, true)}, open interest ${fundingUsd(item.open_interest_usd)}, next settlement ${fundingTime(item.next_funding_at)}`;
+  });
+  return [
+    `AlgoRover funding rate pairs (single-exchange spot/perpetual): ${items.length} of ${payload.matched_total} matching (${scope}).${ignored} ${freshness}`,
+    ...rows,
+    `How to read this: ${FUNDING_NOTES.join(" ")}`,
+    "Answer in the user's language, state the calculation time, and keep these caveats when you discuss returns.",
+  ].join("\n");
 }
 
 const REDEEM_TARGET_CODE = /^[0-9A-Za-z-]{16,32}$/;
