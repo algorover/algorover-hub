@@ -3,7 +3,8 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, open
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { connect } from "node:net";
+import { request as httpRequest } from "node:http";
+import { connect, createServer } from "node:net";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -1477,7 +1478,10 @@ function configuredBootstrapPath() {
 }
 
 function lifecycleProcessEnvironment() {
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "ALGOROVER_ENV", "ALGOROVER_LIVE_DASHBOARD_PORT", "ALGOROVER_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ALGOROVER_PROXY_URL", "ALGOROVER_PROXY_MODE", "XDG_RUNTIME_DIR", "TMPDIR", "USERNAME", "USERDOMAIN", "ALGOROVER_SERVICE_MODE", "ALGOROVER_RUNTIME_PLACEMENT"]).has(key.toUpperCase())));
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "ALGOROVER_ENV", "ALGOROVER_LIVE_DASHBOARD_PORT", "ALGOROVER_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ALGOROVER_PROXY_URL", "ALGOROVER_PROXY_MODE", "XDG_RUNTIME_DIR", "TMPDIR", "USERNAME", "USERDOMAIN", "ALGOROVER_SERVICE_MODE"]).has(key.toUpperCase())));
+  // Bootstrap is always told where this bridge runs: the VPS copy is started with "remote" (ADR 0031),
+  // any other runs on the user's own computer. Bootstrap records it for the Host.
+  environment.ALGOROVER_RUNTIME_PLACEMENT = process.env.ALGOROVER_RUNTIME_PLACEMENT === "remote" ? "remote" : "local";
   const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
   if (names.length === 0) environment.NO_PROXY = "127.0.0.1";
   else for (const name of names) {
@@ -1535,7 +1539,8 @@ function validateDownloadUrl(value) {
 // speaks MCP to a same-version copy of itself on the VPS over SSH, so the remote copy still sees
 // a loopback Runtime and keeps every check it makes. Only one side runs at a time: switching
 // refuses open trading work, stops the other side's services and keeps its install. The
-// Dashboard opens through an SSH tunnel on the same loopback port, so links and cards work.
+// Dashboard opens through an SSH tunnel on the same loopback port; when another program has
+// that port here, on a free one, and the links in results name the port used here.
 // deploy_to_vps prepares the VPS from what the user gives in the conversation (address, user
 // and password or a key file): it installs this product's own SSH key, Node.js, linger and,
 // for root, a service user, so that every later connection logs in with that key.
@@ -1547,13 +1552,17 @@ const remoteTargetPath = join(remoteRoot, "target.json");
 const remoteKnownHosts = join(remoteRoot, "known_hosts");
 const remoteKeyPath = join(remoteRoot, "id_ed25519");
 const remoteTunnelsPath = join(remoteRoot, "tunnels.json");
-// Ports a VPS Host of this product may serve its page on (default and fallback, ADR 0020).
+// Ports a VPS Host of this product serves its page on (production and local environment).
 const REMOTE_DASHBOARD_PORTS = profile === "live" ? [9797, 19797] : [9696, 19696];
 const REMOTE_CONNECT_TIMEOUT_MS = 60_000;
 const REMOTE_LIST_TIMEOUT_MS = 60_000;
 // Same budget as the plugin's tool_timeout_sec (1260 s): a remote install can take minutes.
 const REMOTE_CALL_TIMEOUT_MS = 1_250_000;
 const REMOTE_COMMAND_TIMEOUT_MS = 240_000;
+// One deploy_to_vps call stays under the plugin's tool_timeout_sec: a Runtime that takes longer to
+// install ends the call as "installing" with its progress, and the next call goes on from there.
+const DEPLOY_CALL_BUDGET_MS = 900_000;
+const DEPLOY_MINIMUM_START_WAIT_MS = 60_000;
 const REMOTE_MAX_LINE_BYTES = 2 * 1024 * 1024;
 const MIGRATION_MAX_BYTES = 64 * 1024 * 1024;
 const MIGRATION_MAX_FILE_BYTES = 16 * 1024 * 1024;
@@ -1589,6 +1598,8 @@ let remoteStale = false;
 let remoteToolAnnotations = new Map();
 // Rejected passwords per VPS in this conversation; servers often ban an address after a few.
 const passwordFailures = new Map();
+// The plan the user approved in this conversation: what is left of it needs no second approval.
+let approvedDeploy = null;
 
 function runtimeTargetTool() {
   const secret = { type: "string", minLength: 1, maxLength: 512 };
@@ -1597,8 +1608,8 @@ function runtimeTargetTool() {
     description: [
       `Choose where this AlgoRover ${PRODUCT_NAME} Runtime runs: on this computer (default) or on the user's own Linux VPS (Ubuntu 22.04/24.04 or similar, x86_64), which keeps strategies running while the computer is off. Only one side runs at a time.`,
       "status: the current location.",
-      "deploy_to_vps: ask the user once for the VPS address, SSH port (22 when not given), user name and password, or instead of the password the path of a private key file on this computer (such as a cloud provider's .pem). Pass them exactly as given and never repeat the password in a reply. The first call checks the VPS (it only copies this plugin there) and changes nothing else; it returns needs_input (ask only for the listed items, then call again with all arguments), unsuitable (explain why), refused (explain what to do first) or awaiting_confirmation with a plan. Show the plan and only after the user agrees call deploy_to_vps again with the same arguments plus confirmation: it prepares the VPS (AlgoRover's own SSH key, Node.js, background services, a separate user when given root), installs and starts the Runtime there and, when this computer has one, copies the user's strategies to the VPS and stops the Runtime here. When a step fails, calling deploy_to_vps again continues from it.",
-      "switch_to_local: first returns awaiting_confirmation with a summary and a confirmation digest; only after the user agrees call it again with confirmation. Switching is refused while strategies run or hold positions or a background task runs. force=true is only for a VPS that cannot be reached, after warning that its strategies may still run.",
+      "deploy_to_vps: ask the user once for the VPS address, SSH port (22 when not given), user name and password, or instead of the password the path of a private key file on this computer (such as a cloud provider's .pem). Pass them exactly as given and never repeat the password in a reply. The first call checks the VPS (it only copies this plugin there) and changes nothing else; it returns needs_input (ask only for the listed items, then call again with all arguments), unsuitable (explain why), refused (explain what to do first) or awaiting_confirmation with a plan. Show the plan and only after the user agrees call deploy_to_vps again with the same arguments plus confirmation: it prepares the VPS (AlgoRover's own SSH key, Node.js, background services, a separate user when given root), installs and starts the Runtime there and, when this computer has one, copies the user's strategies to the VPS and stops the Runtime here. When a step fails, calling deploy_to_vps again continues from it without asking the user again. state=installing means the Runtime is still being downloaded or installed on the VPS: tell the user the progress, wait about a minute and call deploy_to_vps again with the same arguments until it returns deployed; never install anything on the VPS by hand. Deploying again to the VPS already in use repairs it when its Runtime there is missing or does not run (for example after the server was reset or reinstalled).",
+      "switch_to_local: first returns awaiting_confirmation with a summary and a confirmation digest; only after the user agrees call it again with confirmation. It stops the VPS Runtime and then starts this computer's own (installing it when there is none, updating an older one); nothing is copied back from the VPS, and local_runtime in the result says whether the Runtime here is ready. Switching is refused while strategies run or hold positions or a background task runs. force=true is only for a VPS that cannot be reached, after warning that its strategies may still run.",
       "When a result's required_action is new_conversation, tell the user to start a new conversation and do not call other AlgoRover tools in this one.",
     ].join(" "),
     inputSchema: { type: "object", additionalProperties: false, required: ["action"], properties: {
@@ -1795,8 +1806,8 @@ const SSH_GUIDANCE = {
   ssh_connection_closed: "The VPS closed the SSH connection. The server may block this address after failed logins, or only allow other networks; check with the user or the VPS provider.",
   ssh_timeout: "The VPS did not answer in time. Check the address and port, the network (a server on an internal network needs this computer on the same network or VPN) and the VPS firewall.",
   ssh_config_invalid: "ssh rejected its configuration or the key file; check the key file path with the user.",
-  node_missing: "The VPS has no usable Node.js; call deploy_to_vps, which installs it.",
-  node_too_old: `The VPS Node.js is older than ${MINIMUM_REMOTE_NODE}; call deploy_to_vps, which installs a current one.`,
+  node_missing: "The VPS has no usable Node.js; call deploy_to_vps for this VPS, which installs it and finishes the setup.",
+  node_too_old: `The VPS Node.js is older than ${MINIMUM_REMOTE_NODE}; call deploy_to_vps for this VPS, which installs a current one and finishes the setup.`,
 };
 
 function guidance(code) { return SSH_GUIDANCE[code] ?? STEP_TEXT[code] ?? "Check the VPS and try again."; }
@@ -2197,16 +2208,25 @@ async function deployToVps(argumentsValue) {
 }
 
 async function deployWith(input, argumentsValue) {
+  const startedAt = Date.now();
   const context = { destination: input.destination };
   if (remoteTarget !== null) {
     const current = remoteTarget.destination;
     const same = current.host === input.destination.host && current.port === input.destination.port
       && [input.destination.user, REMOTE_SERVICE_USER].includes(current.user);
-    if (same) return targetStatus("AlgoRover already runs on this VPS.");
-    return targetResult({ state: "refused", message: "remote_target_active", required_action: "switch_to_local_first" }, true,
+    if (!same) return targetResult({ state: "refused", message: "remote_target_active", required_action: "switch_to_local_first" }, true,
       `AlgoRover ${PRODUCT_NAME} already runs on ${destinationLabel(current)}. Switch back to this computer first (switch_to_local), then deploy to the other VPS: one VPS per product.`);
   }
   if (input.resetHostKey) rmSync(remoteKnownHosts, { force: true });
+  // Deploying again to the VPS in use repairs it: a server that was reset, lost its Node.js or
+  // never got its Runtime goes through the same steps, and only what is missing is done.
+  let resuming = false;
+  if (remoteTarget !== null) {
+    const remote = await remoteRuntimeState();
+    const next = remoteNextAction(remote);
+    if (!["deploy_to_vps", "check_remote_connection"].includes(next)) return targetStatus(next === null ? "AlgoRover already runs on this VPS." : "", remote);
+    resuming = true;
+  }
   const publicKey = await pluginPublicKey();
   const login = await vpsLogin(input);
   if (login.failure) {
@@ -2233,7 +2253,9 @@ async function deployWith(input, argumentsValue) {
     const rejected = evaluation.needs.includes("sudo_password_rejected");
     return needsResult(evaluation.needs, context, `${rejected ? "The sudo password was rejected." : `The user "${facts.user}" needs a sudo password to keep AlgoRover running after logout (linger).`} Ask the user for the sudo password (often the login password) and call deploy_to_vps again with sudo_password; or, if they do not have it, call again with allow_not_durable=true: AlgoRover then stops when nobody is logged in, so it is not suitable for 7x24 live trading.`);
   }
-  const local = await localDisable(true);
+  // The VPS in use already took over from this computer: nothing here stops a second time.
+  const local = resuming ? { state: "moved" } : await localDisable(true);
+  const localRuns = !["not_installed", "moved"].includes(local.state);
   const migration = profile === "live" ? migrationInventory() : { accounts: 0, items: 0, bytes: 0, too_large: false, list: [] };
   const summary = { action: "deploy_to_vps", profile, destination: target, login_user: facts.user, steps: evaluation.steps,
     warnings: evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")), suitable_for_live: evaluation.suitable_for_live, local,
@@ -2244,30 +2266,35 @@ async function deployWith(input, argumentsValue) {
   if (migration.too_large) return targetResult({ state: "refused", message: "migration_too_large", plan }, true,
     "The strategies to copy from this computer exceed 64 MB; nothing was changed.");
   const digest = canonicalDigest(summary);
-  if (input.confirmation !== digest) {
-    const newConversation = local.state !== "not_installed";
+  // Steps already done drop out of a later plan, which changes its digest: an approved plan goes
+  // on while everything else is the same and what is left was part of it.
+  const stable = canonicalDigest({ ...summary, steps: null });
+  const approved = (step) => approvedDeploy.steps.includes(step) || (step === "connect_runtime" && approvedDeploy.steps.includes("install_runtime"));
+  if (input.confirmation === digest) approvedDeploy = { stable, steps: evaluation.steps };
+  else if (approvedDeploy === null || approvedDeploy.stable !== stable || !evaluation.steps.every(approved)) {
     return targetResult({ state: "awaiting_confirmation", plan, confirmation: digest, required_action: "confirm_deploy" }, false, [
       input.confirmation === undefined ? "" : "The situation changed since the last plan; show this new one.",
+      resuming ? "AlgoRover is already set to run on this VPS, but its Runtime there is missing or does not run: this plan repairs it." : "",
       `Ask the user to approve this plan for ${destinationLabel(target)}${facts.user === target.user ? "" : ` (logged in as ${facts.user})`}:`,
       evaluation.steps.map((step, index) => `${index + 1}) ${checkText(step)};`).join(" "),
       profile === "live" && migration.items > 0 ? `then ${migration.items} items from this computer (custom strategies, strategy configurations and installed strategy packages, ${(migration.bytes / 1024 ** 2).toFixed(1)} MB) are copied to the VPS, keeping what is already there; backtest results stay here;` : "",
-      local.state === "not_installed" ? "" : "this computer's Runtime services stop and no longer start automatically; its install and data stay, so switching back is possible;",
-      "on the VPS the user signs in again, enters exchange API keys again (without withdrawal permission) and redeploys strategies.",
+      localRuns ? "this computer's Runtime services stop and no longer start automatically; its install and data stay, so switching back is possible;" : "",
+      "on the VPS the user signs in again, enters exchange API keys again (without withdrawal permission) and redeploys strategies; whatever is set up or created on the VPS stays there: moving back later copies nothing to this computer.",
       fingerprints.length ? `VPS host key ${fingerprints[0].split(" ")[0]} is remembered; a different one later is refused.` : "",
       evaluation.venues ? `Exchanges reachable from the VPS: ${evaluation.venues.filter((venue) => venue.reachable).map((venue) => venue.venue).join(", ") || "none"}${evaluation.venues.some((venue) => !venue.reachable) ? `; not reachable: ${evaluation.venues.filter((venue) => !venue.reachable).map((venue) => venue.venue).join(", ")}` : ""}.` : (profile === "live" ? "Exchange reachability is checked after Node.js is installed." : ""),
       evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")).length ? `Warnings: ${evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")).map(checkText).join("; ")}.` : "",
       evaluation.suitable_for_live ? "The VPS is suitable for 7x24 trading." : "This VPS is NOT suitable for 7x24 live trading: AlgoRover stops when nobody is logged in or after a reboot.",
-      newConversation ? "Afterwards the user continues in a new conversation." : "",
+      localRuns ? "Afterwards the user continues in a new conversation." : "",
       "Only after the user agrees, call deploy_to_vps again with the same arguments plus this confirmation.",
     ].filter(Boolean).join(" "));
   }
-  return executeDeploy({ input, login, facts, target, evaluation, local, migration, publicKey, plan });
+  return executeDeploy({ input, login, target, evaluation, localRuns, resuming, migration, publicKey, plan, startedAt });
 }
 
-async function executeDeploy({ input, login, facts, target, evaluation, local, migration, publicKey, plan }) {
+async function executeDeploy({ input, login, target, evaluation, localRuns, resuming, migration, publicKey, plan, startedAt }) {
   const done = [];
   const failed = (step, code, extra = {}) => targetResult({ state: "error", message: code, failed_step: step, completed_steps: done, plan, required_action: "retry_deploy", ...extra }, true,
-    `Step "${checkText(step)}" failed (${code}): ${guidance(code)} Completed: ${done.length ? done.map(checkText).join("; ") : "nothing"}. Nothing on this computer was changed. Calling deploy_to_vps again continues from the failed step.`);
+    `Step "${checkText(step)}" failed (${code}): ${guidance(code)} Completed: ${done.length ? done.map(checkText).join("; ") : "nothing"}. Nothing on this computer was changed. Calling deploy_to_vps again continues from the failed step without asking the user again.`);
   const privileged = evaluation.steps.filter((step) => ["create_user", "enable_linger", "sync_time", "install_key"].includes(step));
   if (privileged.length) {
     const setup = await runSsh(login.destination, remoteShell(setupScript(privileged), { node: false }), { input: `${input.sudoPassword ?? ""}\n${publicKey}\n`, hostKeys: "accept-new", auth: login.auth, timeoutMs: 120_000 });
@@ -2291,11 +2318,26 @@ async function executeDeploy({ input, login, facts, target, evaluation, local, m
   let started;
   try {
     await channel.open();
-    const response = await channel.request("tools/call", { name: "algorover_runtime_start", arguments: {} }, REMOTE_CALL_TIMEOUT_MS);
-    started = response?.result?.structuredContent ?? null;
+    const wait = Math.max(DEPLOY_MINIMUM_START_WAIT_MS, DEPLOY_CALL_BUDGET_MS - (Date.now() - startedAt));
+    const response = await channel.request("tools/call", { name: "algorover_runtime_start", arguments: {} }, wait);
+    // The VPS bridge answers a start that outlasts its own wait with this error.
+    started = response?.result?.structuredContent ?? (response?.error?.message === "runtime_operation_pending" ? { message: "runtime_operation_pending" } : null);
   } catch (error) {
+    const code = error instanceof BridgeError ? error.code : "remote_start_failed";
+    // No answer within this call's time: the installation goes on by itself on the VPS.
+    if (code !== "remote_timeout") { channel.close(); return failed("install_runtime", code); }
+    started = { message: "runtime_operation_pending" };
+  }
+  if (started?.message === "runtime_operation_pending") {
     channel.close();
-    return failed("install_runtime", error instanceof BridgeError ? error.code : "remote_start_failed");
+    const status = await remoteInstallStatus(target);
+    return targetResult({ state: "installing", message: "runtime_operation_pending", destination: destinationLabel(target), completed_steps: done, remote_status: status, plan,
+      required_action: "wait_and_deploy_again" }, false, [
+      `The AlgoRover Runtime is still being downloaded or installed on the VPS ${destinationLabel(target)}.${installProgressText(status?.lifecycle)}`,
+      done.length ? `Completed in this call: ${done.map(checkText).join("; ")}.` : "",
+      "Tell the user the progress, wait about a minute, then call deploy_to_vps again with the same arguments: it goes on from here without asking the user again and finishes the move.",
+      "Do not start another installation and do not install anything on the VPS by hand. Nothing on this computer was changed yet.",
+    ].filter(Boolean).join(" "));
   }
   if (started?.state !== "ready") {
     channel.close();
@@ -2309,7 +2351,7 @@ async function executeDeploy({ input, login, facts, target, evaluation, local, m
       return failed("install_runtime", error instanceof BridgeError ? error.code : "migration_failed");
     }
   }
-  if (local.state !== "not_installed") {
+  if (localRuns) {
     const disabled = await localDisable(false);
     if (disabled.state === "refused") {
       channel.close();
@@ -2318,26 +2360,46 @@ async function executeDeploy({ input, login, facts, target, evaluation, local, m
     }
   }
   const check = { suitable_for_live: evaluation.suitable_for_live, warnings: evaluation.warnings.filter((code) => !code.startsWith("remote_venue_")) };
-  writePrivateJson(remoteTargetPath, { schema: REMOTE_TARGET_SCHEMA, profile, destination: target, activated_at: new Date().toISOString(), check });
+  writePrivateJson(remoteTargetPath, { schema: REMOTE_TARGET_SCHEMA, profile, destination: target,
+    activated_at: (resuming ? remoteTarget?.activated_at : null) ?? new Date().toISOString(), check });
   remoteTarget = readRemoteTarget();
+  approvedDeploy = null;
   remoteChannel?.close();
   remoteChannel = channel;
   remoteAdmittedRuntimeId = typeof started.runtime_id === "string" ? started.runtime_id : null;
   remoteStale = false;
-  // A first installation had nothing on this computer the conversation could have used.
-  placementSwitched = local.state !== "not_installed";
-  const tunnel = await ensureTunnel(REMOTE_DASHBOARD_PORTS[0]);
+  // A first installation had nothing on this computer the conversation could have used, and a
+  // repaired VPS was already the one this conversation talks to.
+  placementSwitched = localRuns;
+  const { state: tunnel, localPort } = await ensureTunnel(REMOTE_DASHBOARD_PORTS[0]);
   announceListChanged();
-  const dashboard = `http://127.0.0.1:${REMOTE_DASHBOARD_PORTS[0]}/`;
+  const dashboard = `http://127.0.0.1:${localPort}/`;
   return targetResult({ state: "deployed", placement: "remote", destination: destinationLabel(target), completed_steps: done, migration: copied, tunnel, venues,
     suitable_for_live: evaluation.suitable_for_live, dashboard_url: dashboard, required_action: placementSwitched ? "new_conversation" : "continue" }, false, [
-    `AlgoRover ${PRODUCT_NAME} now runs on the VPS ${destinationLabel(target)}.`,
+    `AlgoRover ${PRODUCT_NAME} ${resuming ? "is repaired and runs" : "now runs"} on the VPS ${destinationLabel(target)}.`,
     copied && copied.copied + copied.skipped > 0 ? `Copied ${copied.copied} items from this computer, kept ${copied.skipped} already on the VPS.` : "",
-    local.state === "not_installed" ? "" : "This computer's Runtime is stopped and kept, so switching back is possible.",
+    localRuns ? "This computer's Runtime is stopped and kept, so switching back is possible." : "",
     venues ? `Exchanges reachable from the VPS: ${venues.filter((venue) => venue.reachable).map((venue) => venue.venue).join(", ") || "none"}.` : "",
-    `Dashboard: ${dashboard} (through an SSH tunnel${tunnel === "ok" ? "" : `; tunnel not ready: ${tunnel}`}). There the user signs in, enters exchange API keys (bind them to the VPS's public IP, without withdrawal permission) and deploys strategies.`,
+    `Dashboard: ${dashboard} (through an SSH tunnel${tunnel === "ok" ? "" : `; tunnel not ready: ${TUNNEL_FAILURE_TEXT[tunnel] ?? tunnel}`}). There the user signs in, enters exchange API keys (bind them to the VPS's public IP, without withdrawal permission) and deploys strategies.`,
     placementSwitched ? "Tell the user to start a new conversation." : "Continue in this conversation.",
   ].filter(Boolean).join(" "));
+}
+
+// Moving back uses this computer's ordinary start (ensure-start), which decides by what is here:
+// no Runtime is installed, an older one is updated, a current one just starts. Nothing comes
+// back from the VPS: sign-in, exchange API keys, strategies and results made there stay there.
+const LOCAL_TAKEOVER_TEXT = {
+  install: "this computer has no AlgoRover Runtime yet: it is downloaded, installed and started now, which can take several minutes;",
+  update: "this computer's Runtime is from an older version: it is updated and started now with the data it had before the move;",
+  start: "this computer's Runtime starts now with the data it had before the move;",
+};
+const VPS_KEEPS_TEXT = profile === "live"
+  ? "the sign-in, exchange API keys, strategies installed or created on the VPS and their settings stay on the VPS"
+  : "backtest results made on the VPS stay on the VPS";
+
+async function localTakeover() {
+  const state = (await runtimeStatus()).state;
+  return state === "not_installed" ? "install" : state === "update_required" ? "update" : "start";
 }
 
 async function remoteSwitchToLocal(argumentsValue) {
@@ -2347,7 +2409,8 @@ async function remoteSwitchToLocal(argumentsValue) {
   if (remoteTarget === null) return targetStatus("This product already runs on this computer.");
   const destination = remoteTarget.destination;
   const remote = await remoteDisable(destination, true);
-  const summary = { action: "switch_to_local", profile, destination, remote, force: argumentsValue.force === true };
+  const takeover = await localTakeover();
+  const summary = { action: "switch_to_local", profile, destination, remote, local: takeover, force: argumentsValue.force === true };
   if (remote.state === "refused") return targetResult({ state: "refused", message: remote.code, summary }, true,
     `Cannot switch back yet: on the VPS ${REFUSAL_TEXT[remote.code] ?? remote.code}.`);
   if (remote.state === "unreachable" && argumentsValue.force !== true) return targetResult({ state: "awaiting_confirmation", summary, required_action: "confirm_force_switch" }, true,
@@ -2357,7 +2420,9 @@ async function remoteSwitchToLocal(argumentsValue) {
     return targetResult({ state: "awaiting_confirmation", summary, confirmation: digest, required_action: "confirm_switch" }, false, [
       `Ask the user to approve moving AlgoRover ${PRODUCT_NAME} back to this computer:`,
       remote.state === "unreachable" ? "the VPS is unreachable and is NOT stopped;" : "the VPS Runtime services stop and no longer start automatically; its install and data stay on the VPS;",
-      "this computer's Runtime starts on the next use (it is installed first if needed) with its earlier data; strategies deployed on the VPS must be redeployed here; then the user starts a new conversation.",
+      LOCAL_TAKEOVER_TEXT[takeover],
+      `nothing is copied back: ${VPS_KEEPS_TEXT}${profile === "live" ? ", so on this computer the user signs in, enters exchange API keys and installs and deploys strategies again as needed" : ""};`,
+      "then the user starts a new conversation.",
       "Only after the user agrees, call switch_to_local again with this confirmation.",
     ].join(" "));
   }
@@ -2372,23 +2437,85 @@ async function remoteSwitchToLocal(argumentsValue) {
   remoteChannel?.close();
   remoteChannel = null;
   placementSwitched = true;
+  // The location is this computer from here on, whatever the start below returns: the VPS had no
+  // open work, and a start that fails or is still running continues in the new conversation.
+  let local;
+  try { local = await runLifecycle("ensure-start"); } catch (error) {
+    local = { state: "error", message: error instanceof BridgeError ? error.code : "bootstrap_failed" };
+  }
   announceListChanged();
-  return targetResult({ state: "switched", placement: "local", destination: destinationLabel(destination), required_action: "new_conversation" }, false,
-    `AlgoRover ${PRODUCT_NAME} runs on this computer again${remote.state === "unreachable" ? " (the unreachable VPS was not stopped)" : ""}. Tell the user to start a new conversation; the Runtime here starts (or installs) on first use.`);
+  const localText = local.state === "ready" ? `Its Runtime here is ${{ install: "installed and ", update: "updated and ", start: "" }[takeover]}ready.`
+    : local.message === "runtime_operation_pending" ? "Its Runtime here is still being installed or started: in the new conversation wait until algorover_runtime_status reports ready, and do not start another installation."
+    : ["awaiting_confirmation", "deferred"].includes(local.state) ? "Its Runtime here was not started because updating it needs the user's choice: in the new conversation call algorover_runtime_start and follow its result."
+    : `Its Runtime here did NOT start (${local.message ?? local.state}): in the new conversation call algorover_runtime_start and follow its result. The VPS keeps its install and data, so deploying to it again stays possible.`;
+  return targetResult({ state: "switched", placement: "local", destination: destinationLabel(destination),
+    local_runtime: { action: takeover, state: local.state ?? "error", message: local.message ?? null, runtime_version: local.runtime_version ?? null },
+    required_action: "new_conversation" }, false, [
+    `AlgoRover ${PRODUCT_NAME} runs on this computer again${remote.state === "unreachable" ? " (the unreachable VPS was not stopped)" : ""}.`,
+    localText,
+    `Nothing was copied back: ${VPS_KEEPS_TEXT}.${profile === "live" ? " This computer has only what it had before the move (nothing after a first installation): here the user signs in, enters exchange API keys and installs and deploys strategies as needed." : ""}`,
+    "Tell the user to start a new conversation.",
+  ].join(" "));
 }
 
-async function targetStatus(prefix = "") {
-  let reachable = null, error = null;
-  if (remoteTarget !== null) {
-    try { await openRemote(); reachable = true; } catch (failure) { reachable = false; error = failure instanceof BridgeError ? failure.code : "remote_unreachable"; }
+// What the VPS in use answers right now: its Runtime's state, or why it cannot be asked.
+async function remoteRuntimeState() {
+  try {
+    const channel = await openRemote();
+    const response = await channel.request("tools/call", { name: "algorover_runtime_status", arguments: {} }, REMOTE_LIST_TIMEOUT_MS);
+    const status = response?.result?.structuredContent;
+    if (typeof status?.state !== "string") throw new BridgeError("remote_output_invalid");
+    return { reachable: true, state: status.state, message: typeof status.message === "string" ? status.message : null,
+      runtime_version: typeof status.runtime_version === "string" ? status.runtime_version : null };
+  } catch (error) {
+    return { reachable: false, state: null, message: remoteErrorCode(error), runtime_version: null };
   }
+}
+
+// Progress of an installation still running on the VPS, asked on a connection of its own: the
+// one that started it answers nothing else before the start returns.
+async function remoteInstallStatus(destination) {
+  const channel = new RemoteChannel(destination);
+  try {
+    const response = await channel.request("tools/call", { name: "algorover_runtime_status", arguments: {} }, REMOTE_LIST_TIMEOUT_MS);
+    return response?.result?.structuredContent ?? null;
+  } catch { return null; } finally { channel.close(); }
+}
+
+// Failures of the way to the VPS; any other reason it cannot be asked is repaired by deploying again.
+const REMOTE_CONNECTION_FAILURES = new Set(["ssh_missing", "ssh_timeout", "ssh_host_not_found", "ssh_connection_refused", "ssh_connection_closed"]);
+const REMOTE_NEXT_TEXT = {
+  deploy_to_vps: "Call deploy_to_vps for this VPS (its address, user and the password or key file): it finishes the setup there and leaves what already works.",
+  check_remote_connection: "Strategies already running on the VPS keep running; check the connection, then ask for the status again.",
+  wait_for_runtime_status: "It is still being installed or started: wait and ask for the status again; do not start another installation.",
+  algorover_runtime_start: "Call algorover_runtime_start and follow its result.",
+};
+
+// The one next step when the VPS in use is not ready; null when it is.
+function remoteNextAction(remote) {
+  if (!remote.reachable) return REMOTE_CONNECTION_FAILURES.has(remote.message) ? "check_remote_connection" : "deploy_to_vps";
+  if (remote.state === "ready") return null;
+  if (remote.message === "runtime_operation_pending") return "wait_for_runtime_status";
+  // An update or a switch that waits for the user's choice belongs to the lifecycle tools.
+  return ["not_installed", "stopped", "error"].includes(remote.state) ? "deploy_to_vps" : "algorover_runtime_start";
+}
+
+async function targetStatus(prefix = "", known = null) {
+  const remote = remoteTarget === null ? null : known ?? await remoteRuntimeState();
+  const next = remote === null ? null : remoteNextAction(remote);
   const destination = remoteTarget?.destination ?? null;
   const value = { state: "status", placement: remoteTarget === null ? "local" : "remote", destination: destinationLabel(destination),
-    check: remoteTarget?.check ?? null, remote_reachable: reachable, message: error,
-    tunnels: remoteTarget === null ? [] : readTunnels().map(({ port }) => port), conversation: placementSwitched ? "stale" : "current",
+    check: remoteTarget?.check ?? null, remote_reachable: remote?.reachable ?? null, message: remote === null || remote.reachable ? null : remote.message,
+    remote_runtime: remote === null || !remote.reachable ? null : { state: remote.state, message: remote.message, runtime_version: remote.runtime_version },
+    required_action: next,
+    tunnels: remoteTarget === null ? [] : readTunnels().map((entry) => entry.local_port), conversation: placementSwitched ? "stale" : "current",
     local_runtime_installed: readInstalledRuntimeId() !== null };
-  const where = remoteTarget === null ? "this computer" : `the VPS ${destinationLabel(destination)}${reachable ? "" : ` (unreachable: ${error}; ${guidance(error)})`}`;
-  return targetResult(value, false, `${prefix ? `${prefix} ` : ""}AlgoRover ${PRODUCT_NAME} runs on ${where}.${placementSwitched ? " This conversation was opened before a switch: start a new one." : ""}`);
+  const label = destinationLabel(destination);
+  const where = remote === null ? `AlgoRover ${PRODUCT_NAME} runs on this computer.`
+    : next === null ? `AlgoRover ${PRODUCT_NAME} runs on the VPS ${label}.`
+    : `AlgoRover ${PRODUCT_NAME} is set to run on the VPS ${label}, but ${remote.reachable
+      ? `its Runtime there is not ready (${remote.message ?? remote.state})` : `the VPS cannot be used right now (${remote.message}; ${guidance(remote.message)})`}. ${REMOTE_NEXT_TEXT[next]}`;
+  return targetResult(value, false, `${prefix ? `${prefix} ` : ""}${where}${placementSwitched ? " This conversation was opened before a switch: start a new one." : ""}`);
 }
 
 function targetResult(value, isError, text) {
@@ -2511,10 +2638,18 @@ process.stdout.write(JSON.stringify({ schema: "algorover-remote-migration-v1", c
 }
 
 // --- Dashboard tunnel ----------------------------------------------------------------------
+// One background ssh per VPS Dashboard port. `port` is the VPS Host's port and `local_port` the
+// port on this computer: the same one unless another program has it here, then a free one.
 
 function readTunnels() {
   const value = readPrivateJson(remoteTunnelsPath);
-  return Array.isArray(value?.tunnels) ? value.tunnels.filter((item) => REMOTE_DASHBOARD_PORTS.includes(item?.port) && Number.isSafeInteger(item?.pid) && item.pid > 0) : [];
+  if (!Array.isArray(value?.tunnels)) return [];
+  return value.tunnels.flatMap((item) => {
+    // A tunnel an earlier version of this plugin started has no local_port: it listens on the same port.
+    const localPort = item?.local_port ?? item?.port;
+    return REMOTE_DASHBOARD_PORTS.includes(item?.port) && Number.isSafeInteger(localPort) && localPort > 0 && localPort <= 65535
+      && Number.isSafeInteger(item?.pid) && item.pid > 0 ? [{ ...item, local_port: localPort }] : [];
+  });
 }
 
 function processCommandLine(pid) {
@@ -2533,10 +2668,12 @@ function processCommandLine(pid) {
   return null;
 }
 
+function tunnelForward(entry) { return `127.0.0.1:${entry.local_port}:127.0.0.1:${entry.port}`; }
+
 // Only a process whose command line is this tunnel is ever treated as ours (PIDs are reused).
 function ownTunnel(entry) {
   const command = processCommandLine(entry.pid);
-  return typeof command === "string" && /\bssh(?:\.exe)?\b/u.test(command) && command.includes(`127.0.0.1:${entry.port}:127.0.0.1:${entry.port}`);
+  return typeof command === "string" && /\bssh(?:\.exe)?\b/u.test(command) && command.includes(tunnelForward(entry));
 }
 
 function portOpen(port) {
@@ -2549,56 +2686,126 @@ function portOpen(port) {
   });
 }
 
+// A loopback port nothing listens on now, chosen by the operating system; null when there is none.
+function freeLoopbackPort() {
+  return new Promise((accept) => {
+    const server = createServer();
+    server.once("error", () => accept(null));
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => {
+      const port = server.address()?.port ?? null;
+      server.close(() => accept(port));
+    });
+  });
+}
+
+// Whether the VPS Host serves its page to a browser that opened another port than its own:
+// true, false (a Runtime from before it could: 403 invalid_host), or null when nothing answered.
+function pageAcceptsPort(localPort) {
+  return new Promise((accept) => {
+    const request = httpRequest({ host: "127.0.0.1", port: localPort, path: "/app/api/health", method: "GET", agent: false, timeout: 5000 }, (response) => {
+      response.resume();
+      accept(response.statusCode === 200 ? true : response.statusCode === 403 ? false : null);
+    });
+    request.once("timeout", () => request.destroy());
+    request.once("error", () => accept(null));
+    request.end();
+  });
+}
+
 // Tunnels this process verified recently: a command-line check costs a PowerShell start on Windows.
 const verifiedTunnels = new Map();
+// Tunnel processes on another port whose page the VPS Host has answered through.
+const acceptedTunnels = new Set();
+// The VPS Runtime refused a page opened on another port; cleared when a Runtime starts there.
+let remoteRuntimeFixedPort = false;
 
+function forgetTunnel(entry) {
+  if (ownTunnel(entry)) { try { process.kill(entry.pid); } catch { /* already gone */ } }
+  verifiedTunnels.delete(entry.port);
+  writePrivateJson(remoteTunnelsPath, { schema: "algorover-remote-tunnels-v1", tunnels: readTunnels().filter((item) => item.pid !== entry.pid) });
+}
+
+// The tunnel listens. On another port than the VPS Host's, the Host must also accept the page.
+async function listeningTunnel(entry) {
+  if (entry.local_port === entry.port || acceptedTunnels.has(entry.pid)) return { state: "ok", localPort: entry.local_port };
+  const accepted = await pageAcceptsPort(entry.local_port);
+  if (accepted === false) {
+    remoteRuntimeFixedPort = true;
+    forgetTunnel(entry);
+    return { state: "remote_runtime_fixed_dashboard_port", localPort: entry.port };
+  }
+  if (accepted === true) acceptedTunnels.add(entry.pid);
+  return { state: "ok", localPort: entry.local_port };
+}
+
+// Starts or reuses the tunnel to one VPS Dashboard port. `localPort` is where the page opens on
+// this computer once `state` is "ok"; in every other state it is the VPS port, unchanged.
 async function ensureTunnel(port) {
-  if (remoteTarget === null || !REMOTE_DASHBOARD_PORTS.includes(port)) return "not_remote";
+  if (remoteTarget === null || !REMOTE_DASHBOARD_PORTS.includes(port)) return { state: "not_remote", localPort: port };
   const tunnels = readTunnels();
   const current = tunnels.find((item) => item.port === port);
   const recent = current !== undefined && verifiedTunnels.get(port)?.pid === current.pid && Date.now() - verifiedTunnels.get(port).at < 60_000;
   const alive = current !== undefined && (recent || ownTunnel(current));
   if (alive) verifiedTunnels.set(port, { pid: current.pid, at: recent ? verifiedTunnels.get(port).at : Date.now() });
-  if (alive && await portOpen(port)) return "ok";
-  if (!alive && await portOpen(port)) return "local_dashboard_port_in_use";
+  if (alive && await portOpen(current.local_port)) return listeningTunnel(current);
+  // The same port as on the VPS when it is free here; otherwise the port used before, then any free one.
+  let localPort = null;
+  for (const candidate of new Set([port, ...(current === undefined ? [] : [current.local_port])])) {
+    if (!(await portOpen(candidate))) { localPort = candidate; break; }
+  }
+  if (localPort === null && remoteRuntimeFixedPort) return { state: "remote_runtime_fixed_dashboard_port", localPort: port };
+  localPort ??= await freeLoopbackPort();
+  if (localPort === null) return { state: "local_dashboard_port_in_use", localPort: port };
+  const entry = { port, local_port: localPort, pid: 0, started_at: new Date().toISOString() };
   let child;
   try {
-    child = spawn("ssh", [...sshOptions({ forwarding: true }), "-N", "-L", `127.0.0.1:${port}:127.0.0.1:${port}`, ...sshDestination(remoteTarget.destination)],
+    child = spawn("ssh", [...sshOptions({ forwarding: true }), "-N", "-L", tunnelForward(entry), ...sshDestination(remoteTarget.destination)],
       { detached: true, stdio: "ignore", windowsHide: true, env: sshEnvironment() });
-  } catch { return "ssh_missing"; }
+  } catch { return { state: "ssh_missing", localPort: port }; }
   const exited = new Promise((accept) => { child.once("exit", () => accept(true)); child.once("error", () => accept(true)); });
   child.unref();
-  writePrivateJson(remoteTunnelsPath, { schema: "algorover-remote-tunnels-v1", tunnels: [...tunnels.filter((item) => item.port !== port), { port, pid: child.pid, started_at: new Date().toISOString() }] });
+  entry.pid = child.pid;
+  writePrivateJson(remoteTunnelsPath, { schema: "algorover-remote-tunnels-v1", tunnels: [...tunnels.filter((item) => item.port !== port), entry] });
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    if (await portOpen(port)) return "ok";
-    if (await Promise.race([exited, new Promise((accept) => setTimeout(() => accept(false), 250))])) return "tunnel_failed";
+    if (await portOpen(localPort)) return listeningTunnel(entry);
+    if (await Promise.race([exited, new Promise((accept) => setTimeout(() => accept(false), 250))])) return { state: "tunnel_failed", localPort: port };
   }
-  return "tunnel_timeout";
+  return { state: "tunnel_timeout", localPort: port };
 }
 
 function stopTunnels() {
   verifiedTunnels.clear();
+  acceptedTunnels.clear();
   for (const entry of readTunnels()) {
     if (ownTunnel(entry)) { try { process.kill(entry.pid); } catch { /* already gone */ } }
   }
   rmSync(remoteTunnelsPath, { force: true });
 }
 
+const DASHBOARD_ORIGIN = /http:\/\/127\.0\.0\.1:(\d{2,5})(?!\d)/gu;
+const TUNNEL_FAILURE_TEXT = {
+  local_dashboard_port_in_use: "another program on this computer uses the Dashboard port and no other port is free",
+  remote_runtime_fixed_dashboard_port: "another program on this computer uses the Dashboard port, and the AlgoRover version on the VPS can only be opened on that port: the user closes that program, or updates AlgoRover",
+};
+
 // Every loopback Dashboard origin a VPS result links to gets its tunnel before the link is shown.
-async function ensureTunnelsFor(value) {
-  const ports = new Set();
+// The result comes back naming the ports the page opens on here, with the tunnels that are not ready.
+async function throughTunnels(value) {
   const text = JSON.stringify(value ?? null);
-  for (const match of text.matchAll(/http:\/\/127\.0\.0\.1:(\d{2,5})/gu)) {
+  const ports = new Set();
+  for (const match of text.matchAll(DASHBOARD_ORIGIN)) {
     const port = Number(match[1]);
     if (REMOTE_DASHBOARD_PORTS.includes(port)) ports.add(port);
   }
-  const failures = [];
+  const failures = [], moved = new Map();
   for (const port of ports) {
-    const state = await ensureTunnel(port);
-    if (state !== "ok") failures.push(`${port}:${state}`);
+    const tunnel = await ensureTunnel(port);
+    if (tunnel.state !== "ok") failures.push(`${port}: ${TUNNEL_FAILURE_TEXT[tunnel.state] ?? tunnel.state}`);
+    else if (tunnel.localPort !== port) moved.set(port, tunnel.localPort);
   }
-  return failures;
+  if (moved.size === 0) return { value, failures };
+  return { value: JSON.parse(text.replace(DASHBOARD_ORIGIN, (origin, port) => moved.has(Number(port)) ? `http://127.0.0.1:${moved.get(Number(port))}` : origin)), failures };
 }
 
 // --- the MCP channel to the VPS copy -------------------------------------------------------
@@ -2809,26 +3016,34 @@ async function handleRemoteRequest(request) {
           structuredContent: { ...remoteUnreachableStatus(code), message: "remote_result_unknown" }, isError: true });
       }
     }
-    const result = response?.result;
+    let result = response?.result;
     if (name === "algorover_runtime_status" && Array.isArray(result?.content) && result.content[0]?.type === "text") {
-      result.content[0] = { ...result.content[0], text: `Runs on the VPS ${destinationLabel(remoteTarget.destination)}. ${result.content[0].text}` };
+      // A VPS in use without a Runtime never finished its setup: deploying again does, with the strategies.
+      const missing = result.structuredContent?.state === "not_installed";
+      result.content[0] = { ...result.content[0], text: missing
+        ? `AlgoRover is set to run on the VPS ${destinationLabel(remoteTarget.destination)}, but no Runtime is installed there. ${REMOTE_NEXT_TEXT.deploy_to_vps} Do not install anything on the VPS by hand. ${result.content[0].text}`
+        : `Runs on the VPS ${destinationLabel(remoteTarget.destination)}. ${result.content[0].text}` };
+      if (missing) result.structuredContent = { ...result.structuredContent, required_action: "deploy_to_vps" };
     }
     if (LIFECYCLE_TOOL_NAMES.has(name) && result?.structuredContent?.state === "ready" && typeof result.structuredContent.runtime_id === "string") {
       remoteAdmittedRuntimeId = result.structuredContent.runtime_id;
       remoteStale = false;
+      remoteRuntimeFixedPort = false;
     }
-    if (result !== undefined) {
-      const failures = await ensureTunnelsFor(result);
-      if (failures.length && Array.isArray(result.content)) {
-        result.content = [...result.content, { type: "text", text: `Dashboard tunnel to the VPS is not ready (${failures.join(", ")}); the link may not open until it is.` }];
-      }
+    if (result === undefined) return { ...response, id };
+    const tunnelled = await throughTunnels(result);
+    result = tunnelled.value;
+    if (tunnelled.failures.length && Array.isArray(result.content)) {
+      result = { ...result, content: [...result.content, { type: "text", text: `Dashboard tunnel to the VPS is not ready (${tunnelled.failures.join("; ")}); the link may not open until it is.` }] };
     }
-    return { ...response, id };
+    return { ...response, id, result };
   }
   try {
     const channel = await openRemote();
     const timeout = request.method === "resources/read" ? REMOTE_LIST_TIMEOUT_MS : REMOTE_CALL_TIMEOUT_MS;
     const response = await channel.request(request.method, request.params, timeout);
+    // A card may only open the origins its page lists: they must be the ports used on this computer.
+    if (request.method === "resources/read" && response?.result !== undefined) return { ...response, id, result: (await throughTunnels(response.result)).value };
     return { ...response, id };
   } catch (error) {
     return errorResponse(id, -32001, request.method.startsWith("resources/") ? "runtime_not_ready" : remoteErrorCode(error));

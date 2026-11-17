@@ -64,7 +64,12 @@ Route every ordinary chat request for finding or recommending strategies through
 subjective fit, mixed preferences, “recommend a low-risk strategy” and “find something for
 small capital”. Preserve the user's locale and every supported hard constraint; keep
 unsupported wishes in the natural-language query and disclose constraints the owner cannot
-apply. Never call `algorover_strategy_recommend` or discover/execute
+apply. A crypto exchange (Bybit, Bitget, Gate, Hyperliquid and the like) is not a search
+constraint: the catalog only knows the exchanges a strategy ships settings for, while after
+install the user picks any exchange that lists the strategy's market on its settings page.
+Leave such an exchange out of `query` and `filters.venue` (a venue filter naming one is not
+applied and is reported in `relaxed_filters`), say that the exchange is chosen after install,
+and never conclude from a search that no strategy runs on that exchange. Never call `algorover_strategy_recommend` or discover/execute
 `catalog.strategy.recommend` for an ordinary chat request, and never create a V3
 questionnaire payload. Only an explicit request to open/start the questionnaire or strategy
 onboarding may enter the onboarding flow below. The onboarding App, or its explicitly
@@ -100,18 +105,34 @@ whenever you report the Runtime status or open the Dashboard.
 - `awaiting_confirmation` returns a `plan`: show its steps, what is copied or stopped,
   the exchanges reachable from the VPS and any warnings in plain words, and ask once. Only
   after the user agrees call `deploy_to_vps` again with the same arguments plus the returned
-  `confirmation`. When a step fails, offer to call it again: it continues from that step.
+  `confirmation`. When a step fails, offer to call it again: it continues from that step,
+  in the same conversation without a second approval.
   A refusal (`trading_work_open`, `runtime_in_use`) lists what to stop or wait for
   first; never stop strategies, cancel orders or close positions yourself to make a move
   possible.
+- `state=installing` means the Runtime is still being downloaded or installed on the VPS:
+  tell the user the progress in the result, wait about a minute and call `deploy_to_vps`
+  again with the same arguments until it returns `deployed`. Never install Node.js or the
+  Runtime on the VPS by hand and never run its bootstrap there yourself.
+- When `status` or `algorover_runtime_status` returns `required_action: deploy_to_vps`,
+  the VPS in use lost its Node.js or Runtime (for example it was reset or reinstalled):
+  ask for the VPS login again and call `deploy_to_vps` for the same VPS. It shows a plan
+  that repairs only what is missing and copies the strategies that are not there yet.
 - After `state=deployed`, relay the Dashboard link: there the user signs in again, enters exchange API keys
   (bound to the VPS's public IP, without withdrawal permission) and deploys strategies. If `required_action` is
   `new_conversation`, tell the user to start a new conversation and do not call other
   AlgoRover tools here; with `continue`, carry on in this conversation.
 - `switch_to_local` moves back: show its summary, ask once, then call it again with the
-  returned `confirmation`; afterwards the user starts a new conversation. On the VPS,
-  Dashboard links are the same `http://127.0.0.1:<port>` address and open through an SSH
-  tunnel the bridge keeps; relay a result's tunnel warning. When the VPS cannot be reached,
+  returned `confirmation`. It stops the VPS Runtime and starts this computer's own, installing
+  it when there is none and updating an older one. Nothing is copied back: sign-in, exchange
+  API keys, strategies installed or created on the VPS and their settings stay there, so say
+  that the user signs in, enters API keys and installs strategies here again as needed. Relay
+  `local_runtime`: when its `state` is not `ready`, say so and that the new conversation
+  continues with the Runtime status or start. Afterwards the user starts a new conversation. On the VPS,
+  Dashboard links are still `http://127.0.0.1:<port>` addresses and open through an SSH
+  tunnel the bridge keeps. The port may differ from the usual one when another program on
+  this computer has it: always give the link exactly as the result returns it, never build
+  or correct it; relay a result's tunnel warning. When the VPS cannot be reached,
   its strategies keep running; use `switch_to_local` with `force=true` only after warning the user and at
   their explicit request.
 
@@ -209,8 +230,10 @@ Steps:
    `custom_strategy.draft.write` with the whole file and the `sha256` you read as
    `expected_sha256`. To trade another symbol or timeframe, call `custom_strategy.draft.market`
    with `symbol` (e.g. `SOL`) and `timeframe` (e.g. `4-HOUR`) first without `apply`: it changes
-   the strategy fields, `backtest.markets` and every venue variant together. Tell the user the
-   plan, especially `remove_venues` (exchanges that do not list the symbol), and call it again
+   the strategy fields, `backtest.markets` and every venue variant together, in the named preset
+   and in every other preset of the package that trades the same symbol (`presets` in the plan:
+   `update` follows, `keep` stays on its own market). Tell the user the plan, especially
+   `remove_venues` (exchanges that do not list the symbol) and any preset that stays, and call it again
    with `apply: true`, the plan's `preset_sha256` as `expected_sha256` and `remove_venues` only
    after they agree. A strategy on several markets of one exchange (`market.kind` is `basket`
    in `custom_strategy.get`, with one `slots` entry per symbol) takes `replacements` instead of

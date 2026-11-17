@@ -306,7 +306,7 @@ import * as __algorover_services_dependency_1 from "node:crypto";
 import * as __algorover_services_dependency_2 from "node:fs";
 import * as __algorover_services_dependency_3 from "node:os";
 import * as __algorover_services_dependency_4 from "node:path";
-const { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, writeLauncher, writeServicesRecord } = (() => {
+const { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, resolvedPlacement, writeLauncher, writeServicesRecord } = (() => {
 // User-level services: launcher, service definitions and the service manager
 // (docs/architecture/v2/11 section 1; decisions D40, D41).
 //
@@ -333,6 +333,7 @@ const CAPTURED = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ALGOROV
 // the Dashboard can say where it runs. Only "remote" is kept; local launchers stay unchanged,
 // so the name is never part of their unset line either.
 const PLACEMENT = "ALGOROVER_RUNTIME_PLACEMENT";
+const PLACEMENTS = ["local", "remote"];
 const LAUNCHD_PREFIX = "ai.algorover.";
 
 function failure(code) { return Object.assign(new Error(code), { code }); }
@@ -346,8 +347,23 @@ function launcherPath(home, platform = process.platform) {
   return join(home, "bin", platform === "win32" ? "algorover-launch.vbs" : "algorover-launch");
 }
 
+/**
+ * Where this Runtime runs. The plugin's bridge always says it (the VPS copy "remote", the one on
+ * the user's computer "local"). A caller that says nothing (a command typed on the machine, the
+ * Host starting the trading service) keeps what `runtime/services.json` recorded, so it can
+ * neither turn a VPS Runtime into a local one nor the other way round.
+ */
+function resolvedPlacement(source, recorded) {
+  const stated = Object.entries(source).filter(([key]) => key.toUpperCase() === PLACEMENT).map(([, value]) => value);
+  const chosen = stated.find((value) => PLACEMENTS.includes(value)) ?? recorded;
+  return chosen === "remote" ? "remote" : "local";
+}
+
 /** The session environment a launcher pins (proxy, locale, socket directory roots and remote placement). */
-function capturedEnvironment(source = process.env) {
+function capturedEnvironment(source = process.env, placement = undefined) {
+  if (placement !== undefined) {
+    source = { ...Object.fromEntries(Object.entries(source).filter(([key]) => key.toUpperCase() !== PLACEMENT)), [PLACEMENT]: placement };
+  }
   const result = {};
   for (const [key, value] of Object.entries(source)) {
     const name = key.toUpperCase();
@@ -703,7 +719,7 @@ function defaultSpawnDetached({ platform, launcher, kind, log }) {
   } finally { closeSync(output); }
 }
 
-/** ``runtime/services.json``: how the services run and the commands the Host may run (D43). */
+/** ``runtime/services.json``: how and where the services run and the commands the Host may run (D43). */
 function writeServicesRecord(home, value) {
   atomicWrite(join(home, "runtime", "services.json"), `${JSON.stringify({ schema: SERVICES_SCHEMA, ...value }, null, 2)}\n`, 0o600);
 }
@@ -716,7 +732,7 @@ function readServicesRecord(home) {
     return value?.schema === SERVICES_SCHEMA ? value : null;
   } catch { return null; }
 }
-return { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, writeLauncher, writeServicesRecord };
+return { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, resolvedPlacement, writeLauncher, writeServicesRecord };
 })();
 
 const MANIFEST_DOMAIN = Buffer.from("AlgoRover Runtime Manifest V1\0", "utf8");
@@ -735,7 +751,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.16";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.17";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -2583,13 +2599,17 @@ function serviceManager(home, product, environmentName) {
  * Rewrite the launcher for ``runtime`` and record how the Host may start and restart the
  * trading service (D40, D43). Runs on every start so moved Node or bootstrap paths heal.
  */
-function refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode }) {
+export function refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode }) {
+  // The record is what a running Host reads; the launcher carries the same value to a Host from
+  // before it read the record.
+  const placement = resolvedPlacement(process.env, readServicesRecord(home)?.placement);
+  const environment = capturedEnvironment(process.env, placement);
   writeLauncher(home, {
     runtimeId: runtime.manifest.runtime_id,
     python: safeDestination(runtime.root, runtime.manifest.payload.python.executable),
     host: hostArgs,
     tradingd: product === "live" ? { stateRoot: liveStateRoot, environment: environmentName } : null,
-    environment: capturedEnvironment(),
+    environment,
   });
   const common = ["--product", product, "--runtime-home", home, "--environment", environmentName,
     "--live-state-root", liveStateRoot, "--research-state-root", researchStateRoot,
@@ -2598,11 +2618,11 @@ function refreshServices({ home, runtime, product, environmentName, marketplaceO
   const names = serviceManager(home, product, environmentName).names;
   const python = safeDestination(runtime.root, runtime.manifest.payload.python.executable);
   writeServicesRecord(home, {
-    product, environment: environmentName, mode, launcher: launcherPath(home), services: names,
+    product, environment: environmentName, mode, placement, launcher: launcherPath(home), services: names,
     // Windows runs trading service commands without the .vbs launcher (tradingdCommand).
     ...(product === "live" ? {
       tradingd_command: [python, "-I", "-B", "-m", "algorover.tradingd", "--environment", environmentName],
-      tradingd_environment: { ...capturedEnvironment(), ALGOROVER_HOME: liveStateRoot, ALGOROVER_RUNTIME_ID: runtime.manifest.runtime_id },
+      tradingd_environment: { ...environment, ALGOROVER_HOME: liveStateRoot, ALGOROVER_RUNTIME_ID: runtime.manifest.runtime_id },
     } : {}),
     control: product === "live" ? {
       start_tradingd: [process.execPath, bootstrap, "service", "start", "--service", "tradingd", ...common],
