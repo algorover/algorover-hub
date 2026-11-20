@@ -1672,7 +1672,9 @@ function lifecycleProcessEnvironment() {
   // Bootstrap is always told where this bridge runs: the VPS copy is started with "remote" (ADR 0031),
   // any other runs on the user's own computer. Bootstrap records it for the Host.
   environment.ALGOROVER_RUNTIME_PLACEMENT = process.env.ALGOROVER_RUNTIME_PLACEMENT === "remote" ? "remote" : "local";
+  const proxied = Object.entries(environment).some(([key, value]) => ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "ALGOROVER_PROXY_URL"].includes(key.toUpperCase()) && value);
   const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
+  if (!proxied) return environment;
   if (names.length === 0) environment.NO_PROXY = "127.0.0.1";
   else for (const name of names) {
     const raw = String(environment[name] ?? "");

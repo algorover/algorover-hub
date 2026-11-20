@@ -370,9 +370,30 @@ function capturedEnvironment(source = process.env, placement = undefined) {
     if (CAPTURED.includes(name) && typeof value === "string" && value && !/[\0\r\n]/u.test(value)) result[name] = value;
   }
   if (result[PLACEMENT] !== undefined && result[PLACEMENT] !== "remote") delete result[PLACEMENT];
-  const noProxy = (result.NO_PROXY ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-  if (!noProxy.some((item) => item.toLowerCase() === "127.0.0.1")) result.NO_PROXY = ["127.0.0.1", ...noProxy].join(",");
+  // NO_PROXY is only a fallback for an explicit proxy: Dashboard is on 127.0.0.1, so a
+  // proxy variable with no loopback bypass would make it unreachable. Other bypass
+  // entries stay. The operating system's own exception list is merged when the Host
+  // and the trading service adopt the system proxy.
+  if (explicitProxyConfigured(result)) ensureLoopbackBypass(result);
   return result;
+}
+
+const EXPLICIT_PROXY = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "ALGOROVER_PROXY_URL"];
+
+function explicitProxyConfigured(environment) {
+  return Object.entries(environment).some(([key, value]) => EXPLICIT_PROXY.includes(key.toUpperCase()) && value);
+}
+
+function ensureLoopbackBypass(environment) {
+  const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
+  if (names.length === 0) {
+    environment.NO_PROXY = "127.0.0.1";
+    return;
+  }
+  for (const name of names) {
+    const tokens = String(environment[name] ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+    if (!tokens.some((item) => item.toLowerCase() === "127.0.0.1")) environment[name] = ["127.0.0.1", ...tokens].join(",");
+  }
 }
 
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -751,7 +772,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "0.0.18";
+const BOOTSTRAP_PRODUCT_VERSION = "0.0.19";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.algorover.ai";
@@ -2728,6 +2749,8 @@ export async function startHost({ home = null, stateRoot, pluginStateRoot, liveS
 
 function ensureLoopbackNoProxy(environment) {
   const result = { ...environment };
+  const proxied = Object.entries(result).some(([key, value]) => ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "ALGOROVER_PROXY_URL"].includes(key.toUpperCase()) && value);
+  if (!proxied) return result;
   const names = Object.keys(result).filter((key) => key.toUpperCase() === "NO_PROXY");
   if (names.length === 0) {
     result.NO_PROXY = "127.0.0.1";
@@ -2750,8 +2773,8 @@ export function cleanHostEnvironment() {
   // HOMEDRIVE/HOMEPATH); Unix builds use HOME. USERPROFILE is not the user
   // environment: spawn({env}) replaces inheritance, so proxy variables must
   // be allowlisted or backtests cannot reach venue HTTP endpoints. Forwarded
-  // HTTP(S)_PROXY would otherwise send Host/Dashboard loopback traffic through
-  // the proxy, so NO_PROXY always contains 127.0.0.1.
+  // An explicit proxy without a loopback bypass would send Dashboard traffic
+  // through it, so NO_PROXY then contains 127.0.0.1. No proxy variable, no invented bypass.
   const allowed = new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL",
     "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
